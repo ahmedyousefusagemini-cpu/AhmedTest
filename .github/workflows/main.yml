@@ -45,14 +45,14 @@ jobs:
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ${{ secrets.RDP_PASSWORD}}
+          $securePass = $password
           New-LocalUser -Name "RDPS" -Password secrets.RDP_PASSWORD -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=User: RDPS | Password: secrets.RDP_PASSWORD" >> $env:GITHUB_ENV
           
-          if (-not (Get-LocalUser -Name "RDP")) {
+          if (-not (Get-LocalUser -Name "RDPS")) {
               Write-Error "User creation failed"
               exit 1
           }
@@ -102,7 +102,7 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
+          Write-Host "Username: RDPS"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
           
