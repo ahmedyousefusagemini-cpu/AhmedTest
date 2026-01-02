@@ -44,7 +44,7 @@ jobs:
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = ${{secrets.RDP_PASSWORD}}
+          $password = "You know IT"
           $securePass = ConvertTo-SecureString ${{secrets.RDP_PASSWORD}} -AsPlainText -Force
           New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
