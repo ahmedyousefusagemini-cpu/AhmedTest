@@ -111,16 +111,9 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
-      - name:  logout only on cancel
+      - name: Logout from Tailscale on cancellation
+        if: cancelled()
         run: |
-          Write-Host "logging out Tailscale"
-          # Logout ONLY when workflow is cancelled
-          Register-ObjectEvent -InputObject ([Console]::CancelKeyPress) -EventName CancelKeyPress -Action {
-              Write-Host "Workflow cancelled — logging out of Tailscale..."
-              tailscale logout
-          } | Out-Null
-          Write-Host "Job running. Cancel workflow to trigger logout."
-          while ($true) {
-              Start-Sleep -Seconds 5
-          }
+          echo "Logging out from Tailscale due to workflow cancellation."
+          "$env:Program Files\Tailscale\tailscale.exe" logout
 
