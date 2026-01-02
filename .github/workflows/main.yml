@@ -114,6 +114,7 @@ jobs:
       - name: Logout from Tailscale on cancellation
         if: cancelled()
         run: |
-          echo "Logging out from Tailscale due to workflow cancellation."
-          "$env:Program Files\Tailscale\tailscale.exe" logout
+          echo "Logging out from Tailscale due to workflow cancellation.".
+          #here we excute
+          &"$env:Program Files\Tailscale\tailscale.exe" logout
 
