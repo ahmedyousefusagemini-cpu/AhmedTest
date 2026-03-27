@@ -20,13 +20,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$env:APPDATA\rclone"
           Set-Content -Path "$env:APPDATA\rclone\rclone.conf" -Value $env:RCLONE_CONF_DATA
           
-          # Add Rclone to system path
+          # Add Rclone to GitHub Actions system path securely
           $RclonePath = "$PWD\$RcloneDir"
-          [Environment]::SetEnvironmentVariable("Path", $env:Path + ";$RclonePath", "Machine")
+          echo "$RclonePath" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           
-          # Create workspace and pull existing files from Google Drive
+          # Temporarily add to the current session path so we can use it immediately
+          $env:Path += ";$RclonePath"
+          
+          # Create workspace and pull existing files using the clean command
           New-Item -ItemType Directory -Force -Path "C:\VPS_Workspace"
-          .\$RcloneDir\rclone.exe copy "gdrive:VPS_Workspace" "C:\VPS_Workspace"
+          rclone copy "gdrive:VPS_Workspace" "C:\VPS_Workspace"
           Write-Host "Workspace restored successfully."
 
       - name: 2. Start Background Autosave (Every 5 Mins)
