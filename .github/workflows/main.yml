@@ -9,61 +9,44 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: 1. Setup Storage and Restore State
+      - name: 1. Install WinFsp, Mount Drive, and Map Z: Letter
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
         run: |
+          # Download and install WinFsp silently
+          Write-Host "Installing WinFsp..."
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "winfsp.msi"
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i winfsp.msi /qn /norestart" -Wait
+          
           # Download and install Rclone
+          Write-Host "Setting up Rclone..."
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
           Expand-Archive -Path rclone.zip -DestinationPath .
           $RcloneDir = Get-ChildItem -Directory -Filter "rclone-v*" | Select-Object -ExpandProperty Name
           New-Item -ItemType Directory -Force -Path "$env:APPDATA\rclone"
           Set-Content -Path "$env:APPDATA\rclone\rclone.conf" -Value $env:RCLONE_CONF_DATA
           
-          # Add Rclone to GitHub Actions system path securely
+          # Add Rclone to system path
           $RclonePath = "$PWD\$RcloneDir"
           echo "$RclonePath" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          
-          # Temporarily add to the current session path so we can use it immediately
           $env:Path += ";$RclonePath"
           
-          # Create workspace and pull existing files using the clean command
+          # Create the universal mount point
           New-Item -ItemType Directory -Force -Path "C:\VPS_Workspace"
-          rclone copy "gdrive:VPS_Workspace" "C:\VPS_Workspace"
-          Write-Host "Workspace restored successfully."
-
-      - name: 2. Start Background Autosave (Sync Mode)
-        run: |
-          $ScriptContent = @"
-          while (`$true) {
-              # 'sync' ensures Google Drive exactly matches the local folder, including deletions
-              rclone sync `"C:\VPS_Workspace`" `"gdrive:VPS_Workspace`"
-              Start-Sleep -Seconds 300
-          }
-          "@
-          Set-Content -Path "C:\Autosave.ps1" -Value $ScriptContent
-          Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\Autosave.ps1"
-          Write-Host "Background autosave (sync mode) is running."
           
-      - name: Configure Core RDP Settings
-        run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Start the Live Mount in the background
+          Write-Host "Starting live mount..."
+          $MountScript = "rclone mount `"gdrive:VPS_Workspace`" `"C:\VPS_Workspace`" --vfs-cache-mode writes"
+          Set-Content -Path "C:\MountDrive.ps1" -Value $MountScript
+          Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\MountDrive.ps1"
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
+          # --- NEW: Windows Startup Drive Mapping ---
+          # This creates a script that runs the moment you log into RDP, turning the folder into the Z: drive
+          $StartupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+          Set-Content -Path "$StartupDir\MapGoogleDrive.cmd" -Value "subst Z: C:\VPS_Workspace"
+          # ----------------------------------------
+          
+          Write-Host "Success! Google Drive is mounted and will appear as Z: upon login."
 
       - name: Create RDP User with Secure Password
         run: |
@@ -153,8 +136,3 @@ jobs:
           echo "Logging out from Tailscale due to workflow cancellation.".
           #here we excute
           &"$env:ProgramFiles\Tailscale\tailscale.exe" logout
-      - name: 6. Final Backup (Runs on Shutdown)
-        if: always() 
-        run: |
-          Write-Host "Pushing final state to Google Drive..."
-          rclone sync "C:\VPS_Workspace" "gdrive:VPS_Workspace"
