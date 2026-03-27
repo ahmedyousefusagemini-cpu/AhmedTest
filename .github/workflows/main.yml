@@ -32,19 +32,19 @@ jobs:
           rclone copy "gdrive:VPS_Workspace" "C:\VPS_Workspace"
           Write-Host "Workspace restored successfully."
 
-      - name: 2. Start Background Autosave (Every 5 Mins)
+      - name: 2. Start Background Autosave (Sync Mode)
         run: |
           $ScriptContent = @"
           while (`$true) {
+              # 'sync' ensures Google Drive exactly matches the local folder, including deletions
               rclone sync `"C:\VPS_Workspace`" `"gdrive:VPS_Workspace`"
               Start-Sleep -Seconds 300
           }
           "@
           Set-Content -Path "C:\Autosave.ps1" -Value $ScriptContent
           Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\Autosave.ps1"
-          Write-Host "Background autosave is running."
-
-    
+          Write-Host "Background autosave (sync mode) is running."
+          
       - name: Configure Core RDP Settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
