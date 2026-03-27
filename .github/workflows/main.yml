@@ -9,44 +9,36 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: 1. Install WinFsp, Mount Drive, and Map Z Letter
+      - name: 1. Setup Rclone and Live Mount (Z Drive)
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
         run: |
-          # Download and install WinFsp silently
-          Write-Host "Installing WinFsp..."
+          # 1. Create a public shared folder for the RDP user
+          New-Item -ItemType Directory -Force -Path "C:\RcloneShared"
+          Set-Content -Path "C:\RcloneShared\rclone.conf" -Value $env:RCLONE_CONF_DATA
+          
+          # 2. Install WinFsp silently (Required for drive mapping)
           Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "winfsp.msi"
           Start-Process -FilePath "msiexec.exe" -ArgumentList "/i winfsp.msi /qn /norestart" -Wait
           
-          # Download and install Rclone
-          Write-Host "Setting up Rclone..."
+          # 3. Install Rclone
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
           Expand-Archive -Path rclone.zip -DestinationPath .
           $RcloneDir = Get-ChildItem -Directory -Filter "rclone-v*" | Select-Object -ExpandProperty Name
-          New-Item -ItemType Directory -Force -Path "$env:APPDATA\rclone"
-          Set-Content -Path "$env:APPDATA\rclone\rclone.conf" -Value $env:RCLONE_CONF_DATA
+          Copy-Item -Path ".\$RcloneDir\rclone.exe" -Destination "C:\RcloneShared\rclone.exe"
           
-          # Add Rclone to system path
-          $RclonePath = "$PWD\$RcloneDir"
-          echo "$RclonePath" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          $env:Path += ";$RclonePath"
-          
-          # Create the universal mount point
-          New-Item -ItemType Directory -Force -Path "C:\VPS_Workspace"
-          
-          # Start the Live Mount in the background
-          Write-Host "Starting live mount..."
-          $MountScript = "rclone mount `"gdrive:VPS_Workspace`" `"C:\VPS_Workspace`" --vfs-cache-mode writes"
-          Set-Content -Path "C:\MountDrive.ps1" -Value $MountScript
-          Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\MountDrive.ps1"
-          
-          # --- NEW: Windows Startup Drive Mapping ---
-          # This creates a script that runs the moment you log into RDP, turning the folder into the Z: drive
+          # 4. Create the Startup Script for the RDP user
+          # This forces Google Drive to mount to Z: the second you log in
           $StartupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
-          Set-Content -Path "$StartupDir\MapGoogleDrive.cmd" -Value "subst Z: C:\VPS_Workspace"
-          # ----------------------------------------
+          $VbsContent = 'Set WshShell = CreateObject("WScript.Shell")' + "`r`n" + 'WshShell.Run "C:\RcloneShared\rclone.exe mount gdrive:VPS_Workspace Z: --config ""C:\RcloneShared\rclone.conf"" --vfs-cache-mode writes --volname ""VPS_Drive""", 0, False'
+          Set-Content -Path "$StartupDir\MountDrive.vbs" -Value $VbsContent
           
-          Write-Host "Success! Google Drive is mounted and will appear as Z: upon login."
+          # 5. Create a Desktop Shortcut directly to the Z: Drive
+          $WshShell = New-Object -comObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\Public\Desktop\Google_Drive.lnk")
+          $Shortcut.TargetPath = "Z:\"
+          $Shortcut.Description = "Live Google Drive"
+          $Shortcut.Save()
 
       - name: Create RDP User with Secure Password
         run: |
