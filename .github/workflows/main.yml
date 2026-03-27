@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: 1. Install WinFsp, Mount Drive, and Map Z: Letter
+      - name: 1. Install WinFsp, Mount Drive, and Map Z Letter
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
         run: |
