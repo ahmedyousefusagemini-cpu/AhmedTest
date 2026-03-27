@@ -9,6 +9,39 @@ jobs:
     timeout-minutes: 3600
 
     steps:
+      - name: 1. Setup Storage and Restore State
+        env:
+          RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
+        run: |
+          # Download and install Rclone
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+          Expand-Archive -Path rclone.zip -DestinationPath .
+          $RcloneDir = Get-ChildItem -Directory -Filter "rclone-v*" | Select-Object -ExpandProperty Name
+          New-Item -ItemType Directory -Force -Path "$env:APPDATA\rclone"
+          Set-Content -Path "$env:APPDATA\rclone\rclone.conf" -Value $env:RCLONE_CONF_DATA
+          
+          # Add Rclone to system path
+          $RclonePath = "$PWD\$RcloneDir"
+          [Environment]::SetEnvironmentVariable("Path", $env:Path + ";$RclonePath", "Machine")
+          
+          # Create workspace and pull existing files from Google Drive
+          New-Item -ItemType Directory -Force -Path "C:\VPS_Workspace"
+          .\$RcloneDir\rclone.exe copy "gdrive:VPS_Workspace" "C:\VPS_Workspace"
+          Write-Host "Workspace restored successfully."
+
+      - name: 2. Start Background Autosave (Every 5 Mins)
+        run: |
+          $ScriptContent = @"
+          while (`$true) {
+              rclone sync `"C:\VPS_Workspace`" `"gdrive:VPS_Workspace`"
+              Start-Sleep -Seconds 300
+          }
+          "@
+          Set-Content -Path "C:\Autosave.ps1" -Value $ScriptContent
+          Start-Process powershell.exe -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\Autosave.ps1"
+          Write-Host "Background autosave is running."
+
+    
       - name: Configure Core RDP Settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
@@ -117,4 +150,8 @@ jobs:
           echo "Logging out from Tailscale due to workflow cancellation.".
           #here we excute
           &"$env:ProgramFiles\Tailscale\tailscale.exe" logout
-
+      - name: 6. Final Backup (Runs on Shutdown)
+        if: always() 
+        run: |
+          Write-Host "Pushing final state to Google Drive..."
+          rclone sync "C:\VPS_Workspace" "gdrive:VPS_Workspace"
