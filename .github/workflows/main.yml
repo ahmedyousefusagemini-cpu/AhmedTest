@@ -39,6 +39,30 @@ jobs:
           $Shortcut.TargetPath = "Z:\"
           $Shortcut.Description = "Live Google Drive"
           $Shortcut.Save()
+      - name: Install Sublime Text & Show File Extensions
+        run: |
+          # --- 1. Install Sublime Text silently ---
+          $sublimeUrl = "https://download.sublimetext.com/sublime_text_build_4180_x64_setup.exe"
+          $installerPath = "$env:TEMP\sublime_setup.exe"
+          Invoke-WebRequest -Uri $sublimeUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process -FilePath $installerPath -ArgumentList "/VERYSILENT /NORESTART /SUPPRESSMSGBOXES" -Wait
+          Remove-Item $installerPath -Force
+      
+          # Add Sublime Text to PATH for all users
+          $sublimePath = "C:\Program Files\Sublime Text"
+          [Environment]::SetEnvironmentVariable("Path", "$env:Path;$sublimePath", [EnvironmentVariableTarget]::Machine)
+          Write-Host "Sublime Text installed successfully."
+      
+          # --- 2. Show file extensions in File Explorer ---
+          reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT"
+          Set-ItemProperty -Path "Registry::HKU\DefaultUser\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" `
+            -Name "HideFileExt" -Value 0 -Type DWord
+          reg unload HKU\DefaultUser
+      
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" `
+            -Name "HideFileExt" -Value 0 -Type DWord
+      
+          Write-Host "File extensions are now visible in File Explorer."
 
       - name: Create RDP User with Secure Password
         run: |
