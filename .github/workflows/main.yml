@@ -42,38 +42,23 @@ jobs:
       
       - name: Install Sublime Text, LibreOffice & Show File Extensions
         run: |
-          # --- 1. Install Sublime Text silently ---
-          $sublimeUrl = "https://download.sublimetext.com/sublime_text_build_4180_x64_setup.exe"
-          $installerPath = "$env:TEMP\sublime_setup.exe"
-          Invoke-WebRequest -Uri $sublimeUrl -OutFile $installerPath -UseBasicParsing
-          Start-Process -FilePath $installerPath -ArgumentList "/VERYSILENT /NORESTART /SUPPRESSMSGBOXES" -Wait
-          Remove-Item $installerPath -Force
-      
-          # Add Sublime Text to PATH
-          $sublimePath = "C:\Program Files\Sublime Text"
-          [Environment]::SetEnvironmentVariable("Path", "$env:Path;$sublimePath", [EnvironmentVariableTarget]::Machine)
+          # --- 1. Install Sublime Text via winget ---
+          winget install --id SublimeHQ.SublimeText.4 --silent --accept-package-agreements --accept-source-agreements
           Write-Host "Sublime Text installed successfully."
       
           # --- 2. Set Sublime Text as the default text editor ---
           $sublimeExe = "C:\Program Files\Sublime Text\sublime_text.exe"
       
-          # Register Sublime Text in App Paths
-          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\sublime_text.exe" -Force | Out-Null
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\sublime_text.exe" -Name "(Default)" -Value $sublimeExe
-      
-          # Associate common text file types with Sublime Text
           $extensions = @(".txt", ".log", ".csv", ".json", ".xml", ".yaml", ".yml", ".md", ".ini", ".cfg", ".conf", ".py", ".js", ".ts", ".html", ".css", ".sh", ".bat", ".ps1", ".sql")
           foreach ($ext in $extensions) {
             $progId = "SublimeText$($ext.Replace('.',''))"
-            # Create ProgId
             New-Item -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Force | Out-Null
             Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Name "(Default)" -Value "`"$sublimeExe`" `"%1`""
-            # Associate extension with ProgId
             New-Item -Path "HKLM:\SOFTWARE\Classes\$ext" -Force | Out-Null
             Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$ext" -Name "(Default)" -Value $progId
           }
       
-          # Set for Default user profile (so RDPS user gets it too)
+          # Apply to Default user profile (for RDPS user)
           reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT"
           foreach ($ext in $extensions) {
             $progId = "SublimeText$($ext.Replace('.',''))"
@@ -81,17 +66,10 @@ jobs:
             New-Item -Path $regPath -Force -ErrorAction SilentlyContinue | Out-Null
             Set-ItemProperty -Path $regPath -Name "ProgId" -Value $progId -ErrorAction SilentlyContinue
           }
+          Write-Host "Sublime Text set as default editor."
       
-          Write-Host "Sublime Text set as default editor for common file types."
-      
-          # --- 3. Install LibreOffice silently ---
-          $libreUrl = "https://download.documentfoundation.org/libreoffice/stable/24.8.5/win/x86_64/LibreOffice_24.8.5_Win_x86-64.msi"
-          $libreInstaller = "$env:TEMP\LibreOffice.msi"
-          Write-Host "Downloading LibreOffice..."
-          Invoke-WebRequest -Uri $libreUrl -OutFile $libreInstaller -UseBasicParsing
-          Write-Host "Installing LibreOffice (this may take a few minutes)..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$libreInstaller`"", "/quiet", "/norestart" -Wait
-          Remove-Item $libreInstaller -Force
+          # --- 3. Install LibreOffice via winget ---
+          winget install --id TheDocumentFoundation.LibreOffice --silent --accept-package-agreements --accept-source-agreements
           Write-Host "LibreOffice installed successfully."
       
           # --- 4. Show file extensions in File Explorer ---
