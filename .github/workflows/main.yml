@@ -104,33 +104,33 @@ jobs:
       
           Write-Host "File extensions are now visible in File Explorer."
       
-            - name: Create RDP User with Secure Password
-              run: |
-                Add-Type -AssemblyName System.Security
-                $charSet = @{
-                    Upper   = [char[]](65..90)      # A-Z
-                    Lower   = [char[]](97..122)     # a-z
-                    Number  = [char[]](48..57)      # 0-9
-                    Special = ([char[]](33..47) + [char[]](58..64) +
-                               [char[]](91..96) + [char[]](123..126)) # Special characters
-                }
-                $rawPassword = @()
-                $rawPassword += $charSet.Upper | Get-Random -Count 4
-                $rawPassword += $charSet.Lower | Get-Random -Count 4
-                $rawPassword += $charSet.Number | Get-Random -Count 4
-                $rawPassword += $charSet.Special | Get-Random -Count 4
-                $password = "You know IT"
-                $securePass = ConvertTo-SecureString ${{secrets.RDP_PASSWORD}} -AsPlainText -Force
-                New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
-                Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
-                Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
-                
-                echo "RDP_CREDS=User: RDPS | Password: $password" >> $env:GITHUB_ENV
-                
-                if (-not (Get-LocalUser -Name "RDPS")) {
-                    Write-Error "User creation failed"
-                    exit 1
-                }
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = "You know IT"
+          $securePass = ConvertTo-SecureString ${{secrets.RDP_PASSWORD}} -AsPlainText -Force
+          New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
+          
+          echo "RDP_CREDS=User: RDPS | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDPS")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
