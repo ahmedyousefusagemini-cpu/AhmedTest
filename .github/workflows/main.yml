@@ -58,15 +58,7 @@ jobs:
             Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$ext" -Name "(Default)" -Value $progId
           }
       
-          # Apply to Default user profile (for RDPS user)
-          reg load HKU\DefaultUser "C:\Users\Default\NTUSER.DAT"
-          foreach ($ext in $extensions) {
-            $progId = "SublimeText$($ext.Replace('.',''))"
-            $regPath = "Registry::HKU\DefaultUser\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$ext\UserChoice"
-            New-Item -Path $regPath -Force -ErrorAction SilentlyContinue | Out-Null
-            Set-ItemProperty -Path $regPath -Name "ProgId" -Value $progId -ErrorAction SilentlyContinue
-          }
-          Write-Host "Sublime Text set as default editor."
+          
       
       
       - name: Show File Extensions in File Explorer
