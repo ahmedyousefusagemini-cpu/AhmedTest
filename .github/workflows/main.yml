@@ -40,7 +40,7 @@ jobs:
           $Shortcut.Description = "Live Google Drive"
           $Shortcut.Save()
       
-      - name: Install Sublime Text, LibreOffice & Show File Extensions
+      - name: Install Sublime Text & Show File Extensions
         run: |
           # --- 1. Install Sublime Text via winget ---
           winget install --id SublimeHQ.SublimeText.4 --silent --accept-package-agreements --accept-source-agreements
@@ -68,9 +68,6 @@ jobs:
           }
           Write-Host "Sublime Text set as default editor."
       
-          # --- 3. Install LibreOffice via winget ---
-          winget install --id TheDocumentFoundation.LibreOffice --silent --accept-package-agreements --accept-source-agreements
-          Write-Host "LibreOffice installed successfully."
       
       - name: Show File Extensions in File Explorer
         run: |
