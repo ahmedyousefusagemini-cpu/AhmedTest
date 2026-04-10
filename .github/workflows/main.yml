@@ -72,11 +72,23 @@ jobs:
           winget install --id TheDocumentFoundation.LibreOffice --silent --accept-package-agreements --accept-source-agreements
           Write-Host "LibreOffice installed successfully."
       
-          # --- 4. Show file extensions in File Explorer ---
-          Set-ItemProperty -Path "Registry::HKU\DefaultUser\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" `
-            -Name "HideFileExt" -Value 0 -Type DWord
-          reg unload HKU\DefaultUser
+      - name: Show File Extensions in File Explorer
+        run: |
+          # Machine-wide policy — applies to ALL users, no per-user hive needed
+          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+          if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+          }
+          Set-ItemProperty -Path $regPath -Name "HideFileExt" -Value 0 -Type DWord
       
+          # Also set via Group Policy to enforce for all users
+          $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
+          if (-not (Test-Path $policyPath)) {
+            New-Item -Path $policyPath -Force | Out-Null
+          }
+          Set-ItemProperty -Path $policyPath -Name "HideFileExt" -Value 0 -Type DWord
+      
+          # Current user as well
           Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" `
             -Name "HideFileExt" -Value 0 -Type DWord
       
