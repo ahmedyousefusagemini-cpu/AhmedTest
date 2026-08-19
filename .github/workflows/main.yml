@@ -142,7 +142,7 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Clone Repository, Auto-Pull & Build on RDPS Desktop
+      - name: Clone Repository, Auto-Pull & Create Build Shortcut
         env:
           RDP_GITHUB_PAT: ${{ secrets.RDP_GITHUB_PAT }}
         run: |
@@ -152,11 +152,14 @@ jobs:
           Write-Host "Cloning repository to RDPS Desktop..."
           git clone $RepoURL $DesktopPath
           
-          # Initial build right after cloning
-          if (Test-Path "$DesktopPath\build.bat") {
-              Write-Host "Running initial build.bat..."
-              cmd.exe /c "cd /d $DesktopPath && build.bat > C:\Users\RDPS\Desktop\last_build.log 2>&1"
-          }
+          # Create a desktop shortcut for manual building
+          Write-Host "Creating manual build shortcut on Desktop..."
+          $WshShell = New-Object -comObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build.lnk")
+          $Shortcut.TargetPath = "$DesktopPath\build.bat"
+          $Shortcut.WorkingDirectory = "$DesktopPath"
+          $Shortcut.Description = "Run Build Manually"
+          $Shortcut.Save()
           
           # Create a smart-polling PowerShell script
           $AutoPullScript = @'
@@ -170,7 +173,7 @@ jobs:
                   # Check the remote HEAD hash directly from GitHub
                   $currentHash = (git ls-remote origin HEAD).ToString().Split("`t")[0]
                   
-                  # If the hash changed, pull and build
+                  # If the hash changed, pull
                   if (![string]::IsNullOrEmpty($currentHash) -and !([string]::IsNullOrEmpty($lastHash)) -and ($currentHash -ne $lastHash)) {
                       
                       # 1. Wipe any accidental local modifications to ensure a clean slate
@@ -178,11 +181,6 @@ jobs:
                       
                       # 2. Pull the complete fresh repository state
                       git pull
-                      
-                      # 3. Execute build.bat and output logs to desktop
-                      if (Test-Path "build.bat") {
-                          cmd.exe /c "build.bat > C:\Users\RDPS\Desktop\last_build.log 2>&1"
-                      }
                   }
                   
                   # Update the known hash
