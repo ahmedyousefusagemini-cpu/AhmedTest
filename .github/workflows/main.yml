@@ -142,7 +142,7 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Clone Repository, Auto-Pull & Create Build Shortcut
+      - name: Clone Repository, Auto-Pull & Create CMD Build Shortcut
         env:
           RDP_GITHUB_PAT: ${{ secrets.RDP_GITHUB_PAT }}
         run: |
@@ -152,13 +152,14 @@ jobs:
           Write-Host "Cloning repository to RDPS Desktop..."
           git clone $RepoURL $DesktopPath
           
-          # Create a desktop shortcut for manual building
-          Write-Host "Creating manual build shortcut on Desktop..."
+          # Create a CMD desktop shortcut for manual building
+          Write-Host "Creating manual CMD build shortcut on Desktop..."
           $WshShell = New-Object -comObject WScript.Shell
-          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build.lnk")
-          $Shortcut.TargetPath = "$DesktopPath\build.bat"
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build_CMD.lnk")
+          $Shortcut.TargetPath = "cmd.exe"
+          $Shortcut.Arguments = "/k build.bat"
           $Shortcut.WorkingDirectory = "$DesktopPath"
-          $Shortcut.Description = "Run Build Manually"
+          $Shortcut.Description = "Run Build Manually via CMD"
           $Shortcut.Save()
           
           # Create a smart-polling PowerShell script
