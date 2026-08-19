@@ -144,9 +144,9 @@ jobs:
 
       - name: Clone Repository, Auto-Pull & Build on RDPS Desktop
         env:
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          RDP_GITHUB_PAT: ${{ secrets.RDP_GITHUB_PAT }}
         run: |
-          $RepoURL = "https://$env:GITHUB_PAT@github.com/ahmedyousefusagemini-cpu/dx9-hook.git"
+          $RepoURL = "https://$env:RDP_GITHUB_PAT@github.com/ahmedyousefusagemini-cpu/dx9-hook.git"
           $DesktopPath = "C:\Users\RDPS\Desktop\dx9-hook"
           
           Write-Host "Cloning repository to RDPS Desktop..."
