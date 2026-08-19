@@ -9,7 +9,38 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: 1. Setup Rclone and Live Mount (Z Drive)
+      - name: 1. Create RDP User and Initialize Profile
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = "You know IT"
+          $securePass = ConvertTo-SecureString ${{secrets.RDP_PASSWORD}} -AsPlainText -Force
+          New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
+          
+          # Initialize the user profile so C:\Users\RDPS\Desktop is created natively by Windows
+          $cred = New-Object System.Management.Automation.PSCredential ("RDPS", $securePass)
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c exit" -Credential $cred -LoadUserProfile -Wait
+          
+          echo "RDP_CREDS=User: RDPS | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDPS")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: 2. Setup Rclone and Live Mount (Z Drive)
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
         run: |
@@ -28,27 +59,24 @@ jobs:
           Copy-Item -Path ".\$RcloneDir\rclone.exe" -Destination "C:\RcloneShared\rclone.exe"
           
           # 4. Create the Startup Script for the RDP user
-          # This forces Google Drive to mount to Z: the second you log in
           $StartupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
           $VbsContent = 'Set WshShell = CreateObject("WScript.Shell")' + "`r`n" + 'WshShell.Run "C:\RcloneShared\rclone.exe mount gdrive:VPS_Workspace Z: --config ""C:\RcloneShared\rclone.conf"" --vfs-cache-mode writes --volname ""VPS_Drive""", 0, False'
           Set-Content -Path "$StartupDir\MountDrive.vbs" -Value $VbsContent
           
-          # 5. Create a Desktop Shortcut directly to the Z: Drive
+          # 5. Create a Desktop Shortcut directly to the Z: Drive on RDPS's desktop
           $WshShell = New-Object -comObject WScript.Shell
-          $Shortcut = $WshShell.CreateShortcut("C:\Users\Public\Desktop\Google_Drive.lnk")
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Google_Drive.lnk")
           $Shortcut.TargetPath = "Z:\"
           $Shortcut.Description = "Live Google Drive"
           $Shortcut.Save()
       
       - name: Install Sublime Text & Show File Extensions
         run: |
-          # --- 1. Install Sublime Text via winget ---
           winget install --id SublimeHQ.SublimeText.4 --silent --accept-package-agreements --accept-source-agreements
           Write-Host "Sublime Text installed successfully."
-      
-          # --- 2. Set Sublime Text as the default text editor ---
+          
           $sublimeExe = "C:\Program Files\Sublime Text\sublime_text.exe"
-      
+          
           $extensions = @(".txt", ".log", ".csv", ".json", ".xml", ".yaml", ".yml", ".md", ".ini", ".cfg", ".conf", ".py", ".js", ".ts", ".html", ".css", ".sh", ".bat", ".ps1", ".sql")
           foreach ($ext in $extensions) {
             $progId = "SublimeText$($ext.Replace('.',''))"
@@ -58,58 +86,24 @@ jobs:
             Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$ext" -Name "(Default)" -Value $progId
           }
       
-          
-      
-      
       - name: Show File Extensions in File Explorer
         run: |
-          # Machine-wide policy — applies to ALL users, no per-user hive needed
           $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
           if (-not (Test-Path $regPath)) {
             New-Item -Path $regPath -Force | Out-Null
           }
           Set-ItemProperty -Path $regPath -Name "HideFileExt" -Value 0 -Type DWord
-      
-          # Also set via Group Policy to enforce for all users
+          
           $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
           if (-not (Test-Path $policyPath)) {
             New-Item -Path $policyPath -Force | Out-Null
           }
           Set-ItemProperty -Path $policyPath -Name "HideFileExt" -Value 0 -Type DWord
-      
-          # Current user as well
+          
           Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" `
             -Name "HideFileExt" -Value 0 -Type DWord
-      
+          
           Write-Host "File extensions are now visible in File Explorer."
-      
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = "You know IT"
-          $securePass = ConvertTo-SecureString ${{secrets.RDP_PASSWORD}} -AsPlainText -Force
-          New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
-          
-          echo "RDP_CREDS=User: RDPS | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDPS")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
 
       - name: Install Tailscale
         run: |
@@ -122,10 +116,8 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=${{secrets.HOST_NAME}} --unattended=true
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -143,14 +135,74 @@ jobs:
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
           Write-Host "TCP connectivity successful!"
+
+      - name: Clone Repository, Auto-Pull & Build on RDPS Desktop
+        env:
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+        run: |
+          $RepoURL = "https://$env:GITHUB_PAT@github.com/ahmedyousefusagemini-cpu/dx9-hook.git"
+          $DesktopPath = "C:\Users\RDPS\Desktop\dx9-hook"
+          
+          Write-Host "Cloning repository to RDPS Desktop..."
+          git clone $RepoURL $DesktopPath
+          
+          # Initial build right after cloning
+          if (Test-Path "$DesktopPath\build.bat") {
+              Write-Host "Running initial build.bat..."
+              cmd.exe /c "cd /d $DesktopPath && build.bat > C:\Users\RDPS\Desktop\last_build.log 2>&1"
+          }
+          
+          # Create a smart-polling PowerShell script
+          $AutoPullScript = @'
+          $RepoPath = "C:\Users\RDPS\Desktop\dx9-hook"
+          cd $RepoPath
+          
+          $lastHash = ""
+          
+          while ($true) {
+              try {
+                  # Check the remote HEAD hash directly from GitHub
+                  $currentHash = (git ls-remote origin HEAD).ToString().Split("`t")[0]
+                  
+                  # If the hash changed, pull and build
+                  if (![string]::IsNullOrEmpty($currentHash) -and !([string]::IsNullOrEmpty($lastHash)) -and ($currentHash -ne $lastHash)) {
+                      
+                      # 1. Wipe any accidental local modifications to ensure a clean slate
+                      git reset --hard HEAD
+                      
+                      # 2. Pull the complete fresh repository state
+                      git pull
+                      
+                      # 3. Execute build.bat and output logs to desktop
+                      if (Test-Path "build.bat") {
+                          cmd.exe /c "build.bat > C:\Users\RDPS\Desktop\last_build.log 2>&1"
+                      }
+                  }
+                  
+                  # Update the known hash
+                  if (![string]::IsNullOrEmpty($currentHash)) {
+                      $lastHash = $currentHash
+                  }
+              } catch {
+                  # Silently ignore temporary network drops
+              }
+              
+              # Wait 3 seconds before checking again
+              Start-Sleep -Seconds 3
+          }
+          '@
+          
+          Set-Content -Path "C:\Users\RDPS\Desktop\AutoPuller.ps1" -Value $AutoPullScript
+          
+          # Launch the loop script in the background
+          Write-Host "Starting instant auto-pull background process..."
+          Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\RDPS\Desktop\AutoPuller.ps1"
 
       - name: Maintain Connection
         run: |
@@ -160,14 +212,13 @@ jobs:
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
           
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
+          
       - name: Logout from Tailscale on cancellation
         if: cancelled()
         run: |
-          echo "Logging out from Tailscale due to workflow cancellation.".
-          #here we excute
-          &"$env:ProgramFiles\Tailscale\tailscale.exe" logout
+          echo "Logging out from Tailscale due to workflow cancellation."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
