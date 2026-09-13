@@ -1,4 +1,169 @@
-- name: Clone PacketViwer, Auto-Pull & Create CMD Build Shortcut
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Create RDP User and Initialize Profile
+        env:
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Add-Type -AssemblyName System.Security
+          $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
+          
+          # Enable RDP service and firewall
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # Initialize user profile
+          $cred = New-Object System.Management.Automation.PSCredential ("RDPS", $securePass)
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c exit" -Credential $cred -LoadUserProfile -Wait
+          
+          if (-not (Get-LocalUser -Name "RDPS")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: 2. Setup Rclone and Live Mount (Z Drive)
+        env:
+          RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONF }}
+        run: |
+          New-Item -ItemType Directory -Force -Path "C:\RcloneShared"
+          Set-Content -Path "C:\RcloneShared\rclone.conf" -Value $env:RCLONE_CONF_DATA
+          
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "winfsp.msi"
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i winfsp.msi /qn /norestart" -Wait
+          
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+          Expand-Archive -Path rclone.zip -DestinationPath .
+          $RcloneDir = Get-ChildItem -Directory -Filter "rclone-v*" | Select-Object -ExpandProperty Name
+          Copy-Item -Path ".\$RcloneDir\rclone.exe" -Destination "C:\RcloneShared\rclone.exe"
+          
+          $StartupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+          $VbsContent = 'Set WshShell = CreateObject("WScript.Shell")' + "`r`n" + 'WshShell.Run "C:\RcloneShared\rclone.exe mount gdrive:VPS_Workspace Z: --config ""C:\RcloneShared\rclone.conf"" --vfs-cache-mode writes --volname ""VPS_Drive""", 0, False'
+          Set-Content -Path "$StartupDir\MountDrive.vbs" -Value $VbsContent
+          
+          $WshShell = New-Object -comObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Google_Drive.lnk")
+          $Shortcut.TargetPath = "Z:\"
+          $Shortcut.Description = "Live Google Drive"
+          $Shortcut.Save()
+
+      - name: Install Sublime Text & Associate Extensions
+        run: |
+          winget install --id SublimeHQ.SublimeText.4 --silent --accept-package-agreements --accept-source-agreements
+          Write-Host "Sublime Text installed successfully."
+          
+          $sublimeExe = "C:\Program Files\Sublime Text\sublime_text.exe"
+          $extensions = @(".txt", ".log", ".csv", ".json", ".xml", ".yaml", ".yml", ".md", ".ini", ".cfg", ".conf", ".py", ".js", ".ts", ".html", ".css", ".sh", ".bat", ".ps1", ".sql")
+          foreach ($ext in $extensions) {
+            $progId = "SublimeText$($ext.Replace('.',''))"
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$progId\shell\open\command" -Name "(Default)" -Value "`"$sublimeExe`" `"%1`""
+            New-Item -Path "HKLM:\SOFTWARE\Classes\$ext" -Force | Out-Null
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Classes\$ext" -Name "(Default)" -Value $progId
+          }
+
+      - name: Show File Extensions in File Explorer
+        run: |
+          $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+          Set-ItemProperty -Path $regPath -Name "HideFileExt" -Value 0 -Type DWord
+          
+          $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
+          if (-not (Test-Path $policyPath)) { New-Item -Path $policyPath -Force | Out-Null }
+          Set-ItemProperty -Path $policyPath -Name "HideFileExt" -Value 0 -Type DWord
+          
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "HideFileExt" -Value 0 -Type DWord
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=${{ secrets.HOST_NAME }} --unattended=true
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Clone dx9-hook, Auto-Pull & Create CMD Build Shortcut
+        env:
+          RDP_GITHUB_PAT: ${{ secrets.RDP_GITHUB_PAT }}
+        run: |
+          $RepoURL = "https://$env:RDP_GITHUB_PAT@github.com/ahmedyousefusagemini-cpu/dx9-hook.git"
+          $DesktopPath = "C:\Users\RDPS\Desktop\dx9-hook"
+          
+          Write-Host "Cloning repository to RDPS Desktop..."
+          git clone $RepoURL $DesktopPath
+          
+          Write-Host "Creating manual CMD build shortcut on Desktop..."
+          $WshShell = New-Object -comObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build_CMD.lnk")
+          $Shortcut.TargetPath = "cmd.exe"
+          $Shortcut.Arguments = "/k build.bat"
+          $Shortcut.WorkingDirectory = "$DesktopPath"
+          $Shortcut.Description = "Run Build Manually via CMD"
+          $Shortcut.Save()
+          
+          $AutoPullScript = @'
+          $RepoPath = "C:\Users\RDPS\Desktop\dx9-hook"
+          cd $RepoPath
+          
+          $lastHash = ""
+          
+          while ($true) {
+              try {
+                  $currentHash = (git ls-remote origin HEAD).ToString().Split("`t")[0]
+                  if (![string]::IsNullOrEmpty($currentHash) -and !([string]::IsNullOrEmpty($lastHash)) -and ($currentHash -ne $lastHash)) {
+                      git reset --hard HEAD
+                      git pull
+                  }
+                  if (![string]::IsNullOrEmpty($currentHash)) {
+                      $lastHash = $currentHash
+                  }
+              } catch {}
+              Start-Sleep -Seconds 3
+          }
+          '@
+          
+          Set-Content -Path "C:\Users\RDPS\Desktop\AutoPuller.ps1" -Value $AutoPullScript
+          Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\RDPS\Desktop\AutoPuller.ps1"
+
+      - name: Clone PacketViwer, Auto-Pull & Create CMD Build Shortcut
         env:
           RDP_GITHUB_PAT: ${{ secrets.RDP_GITHUB_PAT }}
         run: |
@@ -8,7 +173,6 @@
           Write-Host "Cloning PacketViwer repository to RDPS Desktop..."
           git clone $RepoURL $DesktopPath
           
-          # Create a CMD desktop shortcut for manual building
           Write-Host "Creating manual CMD build shortcut on Desktop..."
           $WshShell = New-Object -comObject WScript.Shell
           $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build_PacketViwer_CMD.lnk")
@@ -18,7 +182,6 @@
           $Shortcut.Description = "Run PacketViwer Build Manually via CMD"
           $Shortcut.Save()
           
-          # Create a smart-polling PowerShell script
           $AutoPullScript = @'
           $RepoPath = "C:\Users\RDPS\Desktop\PacketViwer"
           cd $RepoPath
@@ -27,29 +190,35 @@
           
           while ($true) {
               try {
-                  # Check the remote HEAD hash directly from GitHub
                   $currentHash = (git ls-remote origin HEAD).ToString().Split("`t")[0]
-                  
-                  # If the hash changed, pull
                   if (![string]::IsNullOrEmpty($currentHash) -and !([string]::IsNullOrEmpty($lastHash)) -and ($currentHash -ne $lastHash)) {
                       git reset --hard HEAD
                       git pull
                   }
-                  
-                  # Update the known hash
                   if (![string]::IsNullOrEmpty($currentHash)) {
                       $lastHash = $currentHash
                   }
-              } catch {
-                  # Silently ignore temporary network drops
-              }
-              
+              } catch {}
               Start-Sleep -Seconds 3
           }
           '@
           
           Set-Content -Path "C:\Users\RDPS\Desktop\AutoPuller_PacketViwer.ps1" -Value $AutoPullScript
-          
-          # Launch the loop script in the background
-          Write-Host "Starting instant auto-pull background process for PacketViwer..."
           Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\RDPS\Desktop\AutoPuller_PacketViwer.ps1"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDPS"
+          Write-Host "==================`n"
+          
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Workflow will run until stopped or timeout limit reached"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Logout from Tailscale on exit
+        if: always()
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
