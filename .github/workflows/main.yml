@@ -25,7 +25,7 @@ jobs:
           
           # Initialize user profile
           $cred = New-Object System.Management.Automation.PSCredential ("RDPS", $securePass)
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c exit" -Credential $cred -LoadUserProfile -Wait
+          Start-Process -FilePath "cmd.exe" -ArgumentList " /c exit" -Credential $cred -LoadUserProfile -Wait
           
           if (-not (Get-LocalUser -Name "RDPS")) {
               Write-Error "User creation failed"
@@ -40,7 +40,7 @@ jobs:
           Set-Content -Path "C:\RcloneShared\rclone.conf" -Value $env:RCLONE_CONF_DATA
           
           Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" -OutFile "winfsp.msi"
-          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i winfsp.msi /qn /norestart" -Wait
+          Start-Process -FilePath "msiexec.exe" -ArgumentList " /i winfsp.msi /qn /norestart" -Wait
           
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
           Expand-Archive -Path rclone.zip -DestinationPath .
@@ -89,7 +89,7 @@ jobs:
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList " /i", "`"$installerPath`"", " /quiet", " /norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
@@ -134,7 +134,7 @@ jobs:
           $WshShell = New-Object -comObject WScript.Shell
           $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build_CMD.lnk")
           $Shortcut.TargetPath = "cmd.exe"
-          $Shortcut.Arguments = "/k build.bat"
+          $Shortcut.Arguments = " /k build.bat"
           $Shortcut.WorkingDirectory = "$DesktopPath"
           $Shortcut.Description = "Run Build Manually via CMD"
           $Shortcut.Save()
@@ -177,7 +177,7 @@ jobs:
           $WshShell = New-Object -comObject WScript.Shell
           $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build_PacketViwer_CMD.lnk")
           $Shortcut.TargetPath = "cmd.exe"
-          $Shortcut.Arguments = "/k build.bat"
+          $Shortcut.Arguments = " /k build.bat"
           $Shortcut.WorkingDirectory = "$DesktopPath"
           $Shortcut.Description = "Run PacketViwer Build Manually via CMD"
           $Shortcut.Save()
@@ -205,6 +205,49 @@ jobs:
           
           Set-Content -Path "C:\Users\RDPS\Desktop\AutoPuller_PacketViwer.ps1" -Value $AutoPullScript
           Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\RDPS\Desktop\AutoPuller_PacketViwer.ps1"
+
+      - name: Clone private-server-anti-detect-bypass, Auto-Pull & Create CMD Build Shortcut
+        env:
+          RDP_GITHUB_PAT: ${{ secrets.RDP_GITHUB_PAT }}
+        run: |
+          $RepoURL = "https://$env:RDP_GITHUB_PAT@github.com/ahmedyousefusagemini-cpu/private-server-anti-detect-bypass.git"
+          $DesktopPath = "C:\Users\RDPS\Desktop\private-server-anti-detect-bypass"
+          
+          Write-Host "Cloning private-server-anti-detect-bypass repository to RDPS Desktop..."
+          git clone $RepoURL $DesktopPath
+          
+          Write-Host "Creating manual CMD build shortcut on Desktop..."
+          $WshShell = New-Object -comObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut("C:\Users\RDPS\Desktop\Run_Build_private_server_anti_detect_bypass_CMD.lnk")
+          $Shortcut.TargetPath = "cmd.exe"
+          $Shortcut.Arguments = " /k build.bat"
+          $Shortcut.WorkingDirectory = "$DesktopPath"
+          $Shortcut.Description = "Run private-server-anti-detect-bypass Build Manually via CMD"
+          $Shortcut.Save()
+          
+          $AutoPullScript = @'
+          $RepoPath = "C:\Users\RDPS\Desktop\private-server-anti-detect-bypass"
+          cd $RepoPath
+          
+          $lastHash = ""
+          
+          while ($true) {
+              try {
+                  $currentHash = (git ls-remote origin HEAD).ToString().Split("`t")[0]
+                  if (![string]::IsNullOrEmpty($currentHash) -and !([string]::IsNullOrEmpty($lastHash)) -and ($currentHash -ne $lastHash)) {
+                      git reset --hard HEAD
+                      git pull
+                  }
+                  if (![string]::IsNullOrEmpty($currentHash)) {
+                      $lastHash = $currentHash
+                  }
+              } catch {}
+              Start-Sleep -Seconds 3
+          }
+          '@
+          
+          Set-Content -Path "C:\Users\RDPS\Desktop\AutoPuller_private_server_anti_detect_bypass.ps1" -Value $AutoPullScript
+          Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\RDPS\Desktop\AutoPuller_private_server_anti_detect_bypass.ps1"
 
       - name: Maintain Connection
         run: |
