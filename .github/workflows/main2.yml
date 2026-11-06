@@ -1,0 +1,121 @@
+name: RDPWINDOWS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Create RDP User and Initialize Profile
+        env:
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          New-LocalUser -Name "RDPS" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPS"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPS"
+
+          # Enable RDP service and firewall
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Initialize user profile
+          $cred = New-Object System.Management.Automation.PSCredential ("RDPS", $securePass)
+          Start-Process -FilePath "cmd.exe" -ArgumentList " /c exit" -Credential $cred -LoadUserProfile -Wait
+
+          if (-not (Get-LocalUser -Name "RDPS")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: 2. Auto-Open Webex in Chrome at RDP Login
+        run: |
+          $chromeExe = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chromeExe)) {
+              $chromeExe = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+          }
+          if (-not (Test-Path $chromeExe)) {
+              winget install --id Google.Chrome --exact --silent --accept-package-agreements --accept-source-agreements
+              $chromeExe = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          }
+          if (-not (Test-Path $chromeExe)) {
+              Write-Error "Google Chrome is not available"
+              exit 1
+          }
+
+          # All-users Startup: opens in the RDPS desktop session when they connect via RDP
+          $startupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+          New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+
+          $WshShell = New-Object -ComObject WScript.Shell
+          $shortcut = $WshShell.CreateShortcut("$startupDir\OpenWebex.lnk")
+          $shortcut.TargetPath = $chromeExe
+          $shortcut.Arguments = '--no-first-run --no-default-browser-check --new-window "https://signin.webex.com/joinameeting"'
+          $shortcut.Description = "Open Webex join-a-meeting page"
+          $shortcut.Save()
+          Write-Host "Startup shortcut created: $startupDir\OpenWebex.lnk"
+
+      - name: 3. Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList " /i", "`"$installerPath`"", " /quiet", " /norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: 4. Establish Tailscale Connection
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY_WINDOWS_RDP }}
+          TS_HOSTNAME: ${{ secrets.HOST_NAME_WINDOWS_RDP }}
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $upArgs = @("up", "--authkey=$env:TS_AUTHKEY", "--unattended=true")
+          if (-not [string]::IsNullOrWhiteSpace($env:TS_HOSTNAME)) {
+              $upArgs += "--hostname=$env:TS_HOSTNAME"
+          }
+          & $tsExe @upArgs
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & $tsExe ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: 5. Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: 6. Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDPS"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Workflow will run until stopped or timeout limit reached"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: 7. Logout from Tailscale on exit
+        if: always()
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tsExe) { & $tsExe logout }
