@@ -129,8 +129,29 @@ jobs:
         run: |
           $proxyDir = "C:\freepi-proxy"
           New-Item -ItemType Directory -Force -Path $proxyDir | Out-Null
-          [IO.File]::WriteAllBytes("$proxyDir\proxy.mjs", [Convert]::FromBase64String($env:PROXY_B64))
-          [IO.File]::WriteAllBytes("$proxyDir\mcp.mjs", [Convert]::FromBase64String($env:PROXY_MCP_B64))
+          # Primary source: the repo's proxy/ folder - update the proxy by
+          # pushing proxy/proxy.mjs; no workflow edit needed. The embedded
+          # PROXY_B64 / PROXY_MCP_B64 blobs are only a last-known-good fallback.
+          $downloaded = $false
+          if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+              try {
+                  foreach ($f in @("proxy.mjs", "mcp.mjs")) {
+                      $r = Invoke-WebRequest -Uri "https://api.github.com/repos/$($env:GH_REPO)/contents/proxy/$f" -Headers @{ Authorization = "Bearer $($env:GH_TOKEN)"; Accept = "application/vnd.github.raw" } -TimeoutSec 20
+                      [IO.File]::WriteAllBytes("$proxyDir\$f", $r.Content)
+                  }
+                  $downloaded = $true
+                  Write-Host "Proxy scripts downloaded from repo proxy/ folder"
+              } catch {
+                  Write-Warning "Repo download failed ($($_.Exception.Message)) - using embedded fallback"
+              }
+          } else {
+              Write-Warning "RDP_GITHUB_PAT not set - cannot download proxy scripts, using embedded fallback"
+          }
+          if (-not $downloaded) {
+              [IO.File]::WriteAllBytes("$proxyDir\proxy.mjs", [Convert]::FromBase64String($env:PROXY_B64))
+              [IO.File]::WriteAllBytes("$proxyDir\mcp.mjs", [Convert]::FromBase64String($env:PROXY_MCP_B64))
+              Write-Host "Proxy scripts restored from embedded fallback"
+          }
 
           # Optional: MCP servers config from secret (same format as mcp.json)
           if (-not [string]::IsNullOrWhiteSpace($env:FREEPI_MCP_JSON)) {
@@ -216,6 +237,34 @@ jobs:
           $env:GH_REPO = if ([string]::IsNullOrWhiteSpace($env:GH_REPO)) { [Environment]::GetEnvironmentVariable("GH_REPO", "Machine") } else { $env:GH_REPO }
 
           while ($true) {
+              # Self-update: fetch the proxy scripts from the repo's proxy/
+              # folder; when either changed, swap them in and restart node so
+              # proxy updates land mid-session without re-running the workflow.
+              # Byte-exact SHA256 compare, encoding-proof.
+              if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+                  try {
+                      $updated = $false
+                      $sha = [System.Security.Cryptography.SHA256]::Create()
+                      foreach ($f in @("proxy.mjs", "mcp.mjs")) {
+                          $r = Invoke-WebRequest -Uri "https://api.github.com/repos/$($env:GH_REPO)/contents/proxy/$f" -Headers @{ Authorization = "Bearer $($env:GH_TOKEN)"; Accept = "application/vnd.github.raw" } -TimeoutSec 20
+                          $remoteHash = [Convert]::ToBase64String($sha.ComputeHash($r.Content))
+                          $localHash = [Convert]::ToBase64String($sha.ComputeHash([IO.File]::ReadAllBytes("C:\freepi-proxy\$f")))
+                          if ($remoteHash -ne $localHash) {
+                              [IO.File]::WriteAllBytes("C:\freepi-proxy\$f", $r.Content)
+                              $updated = $true
+                              Write-Host "[$(Get-Date)] $f changed in repo - proxy restart scheduled"
+                          }
+                      }
+                      if ($updated) {
+                          Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force
+                          Start-Sleep -Seconds 2
+                          Start-Process -FilePath "node" -ArgumentList '"C:\freepi-proxy\proxy.mjs"' -WindowStyle Hidden
+                          Write-Host "[$(Get-Date)] Proxy restarted with updated scripts"
+                      }
+                  } catch {
+                      Write-Host "[$(Get-Date)] Self-update check skipped: $($_.Exception.Message)"
+                  }
+              }
               try {
                   $h = Invoke-RestMethod "http://127.0.0.1:8085/health" -TimeoutSec 3
                   if ($h.ok) {
