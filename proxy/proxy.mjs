@@ -184,29 +184,115 @@ function statsSnapshot() {
   };
 }
 
-// ---------- client version (dynamic, follows the installed CLI) ----------
+// ---------- client version (self-healing, never stale) ----------
 
-// The backend rejects requests whose x-client-version is below its required
-// minimum with HTTP 426 upgrade_required. The free-pi CLI writes its own
-// version to ~/.free-pi/agent/last-seen-version on every run, so read that
-// dynamically instead of hardcoding: the proxy then always matches whatever
-// CLI version is installed, with no manual bumping after CLI updates.
-// Priority: FREEPI_CLIENT_VERSION env > last-seen-version file > fallback.
+// The backend rejects chat requests whose x-client-version is below its
+// required minimum with HTTP 426 upgrade_required. Version sources, in
+// priority order:
+//   1. FREEPI_CLIENT_VERSION env           (explicit override)
+//   2. ~/.free-pi/agent/last-seen-version  (what the installed CLI last reported)
+//   3. client-version-state.json           (last version this proxy resolved)
+//   4. backend /client-version "latest"    (authoritative; always >= its "min")
+// The backend publishes { min, latest } on GET /client-version and accepts any
+// version on that endpoint, so the proxy can always learn the current minimum.
+// If the version file is missing or below the backend minimum, the proxy uses
+// the backend's latest and records it; a 426 triggers a forced refresh plus
+// one retry, so outdated-version errors self-heal instead of surfacing.
 const VERSION_FILE = path.join(os.homedir(), ".free-pi", "agent", "last-seen-version");
-const LAST_RESORT_VERSION = "0.6.17";
-let versionCache = { version: null, mtime: 0 };
+const PROXY_DIR = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+const VERSION_STATE_FILE = path.join(PROXY_DIR, "client-version-state.json");
+const VERSION_INFO_TTL_MS = 10 * 60 * 1000;
+let currentVersion = null;
+let envOverrideBypassed = false; // set when FREEPI_CLIENT_VERSION is below the backend minimum
+let versionInfo = { min: null, latest: null, at: 0 };
+let versionInfoPromise = null;
+
+function cmpVersions(a, b) {
+  const pa = String(a ?? "").split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b ?? "").split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) { const d = (pa[i] ?? 0) - (pb[i] ?? 0); if (d) return d < 0 ? -1 : 1; }
+  return 0;
+}
+
+function fileVersion() {
+  try { return fs.readFileSync(VERSION_FILE, "utf8").trim() || null; } catch { return null; }
+}
+
+function stateVersion() {
+  try { return JSON.parse(fs.readFileSync(VERSION_STATE_FILE, "utf8")).version || null; } catch { return null; }
+}
+
+function setClientVersion(version, source) {
+  if (!version) return;
+  currentVersion = version;
+  // Always persist, even when unchanged, so the state file is a reliable
+  // fallback if last-seen-version disappears and the backend is unreachable.
+  try {
+    fs.writeFileSync(VERSION_STATE_FILE, JSON.stringify({ version, source, at: new Date().toISOString() }, null, 2));
+  } catch { /* non-fatal: in-memory value still applies */ }
+}
 
 function getClientVersion() {
-  if (process.env.FREEPI_CLIENT_VERSION) return process.env.FREEPI_CLIENT_VERSION;
-  try {
-    const mtime = fs.statSync(VERSION_FILE).mtimeMs;
-    if (!versionCache.version || mtime !== versionCache.mtime) {
-      versionCache = { version: fs.readFileSync(VERSION_FILE, "utf8").trim() || LAST_RESORT_VERSION, mtime };
-    }
-  } catch {
-    versionCache = { version: LAST_RESORT_VERSION, mtime: 0 };
+  if (process.env.FREEPI_CLIENT_VERSION && !envOverrideBypassed) return process.env.FREEPI_CLIENT_VERSION;
+  return currentVersion ?? "0.0.0";
+}
+
+async function fetchVersionInfo({ force = false } = {}) {
+  if (!force && versionInfo.at && Date.now() - versionInfo.at < VERSION_INFO_TTL_MS) return versionInfo;
+  if (versionInfoPromise) return versionInfoPromise;
+  versionInfoPromise = (async () => {
+    try {
+      const res = await fetch(`${BASE}/client-version`, { headers: { "x-client-version": getClientVersion() } });
+      if (res.ok) {
+        const body = await res.json().catch(() => null);
+        if (body?.min || body?.latest) {
+          versionInfo = { min: body.min ?? null, latest: body.latest ?? null, at: Date.now() };
+        }
+      }
+    } catch { /* offline: keep previous info */ }
+    versionInfoPromise = null;
+    return versionInfo;
+  })();
+  return versionInfoPromise;
+}
+
+// Picks the best version to send and records it. Called at startup and on 426.
+async function refreshClientVersion({ force = false } = {}) {
+  const info = await fetchVersionInfo({ force });
+  const envV = process.env.FREEPI_CLIENT_VERSION;
+  if (envV && !envOverrideBypassed && (!info.min || cmpVersions(envV, info.min) >= 0)) {
+    setClientVersion(envV, "FREEPI_CLIENT_VERSION");
+    return currentVersion;
   }
-  return versionCache.version;
+  if (envV && info.min && cmpVersions(envV, info.min) < 0) {
+    // An explicit override below the backend minimum would cause permanent
+    // 426s, so bypass it and say so loudly instead of failing forever.
+    envOverrideBypassed = true;
+    console.warn(`[version] FREEPI_CLIENT_VERSION=${envV} is below the backend minimum ${info.min}; sending ${info.latest ?? info.min} instead. Unset the env var or run npx free-pi-cli@latest to stop seeing this warning.`);
+  }
+  const fv = fileVersion();
+  // The installed CLI's own report is the most truthful sender, but only while
+  // it still satisfies the backend minimum; otherwise send the backend latest.
+  if (fv && (!info.min || cmpVersions(fv, info.min) >= 0)) {
+    setClientVersion(fv, "last-seen-version");
+  } else if (info.latest) {
+    const why = fv && info.min && cmpVersions(fv, info.min) < 0
+      ? `backend latest (version file ${fv} is below backend min ${info.min})`
+      : "backend latest (no version file)";
+    setClientVersion(info.latest, why);
+  } else {
+    const sv = stateVersion();
+    if (sv) setClientVersion(sv, "state file");
+  }
+  return currentVersion;
+}
+
+async function initClientVersion() {
+  const sv = stateVersion();
+  if (sv) currentVersion = sv; // provisional, so early requests have something sane
+  const fv = fileVersion();
+  if (fv) currentVersion = fv; // the real CLI's report wins over the state file
+  await refreshClientVersion();
 }
 
 // ---------- credentials (cached, refreshed on 401 or file change) ----------
@@ -754,11 +840,11 @@ async function handleChatCompletions(req, res) {
     return json(res, 502, openAIError(`Cannot reach free-pi backend: ${err.message}`, "api_error"));
   }
 
-  // Expired sign-in or outdated client version: credentials.json and
-  // last-seen-version may both have been refreshed on disk; retry once.
+  // Expired sign-in or outdated client version: refresh credentials and ask
+  // the backend for its current minimum/latest version, then retry once.
   if (upstream.status === 401 || upstream.status === 426) {
     credCache = { token: null, mtime: 0 };
-    versionCache = { version: null, mtime: 0 };
+    if (upstream.status === 426) await refreshClientVersion({ force: true });
     const fresh = loadToken();
     const freshVersion = getClientVersion();
     if (fresh && (fresh !== token || freshVersion !== sentVersion)) {
@@ -781,7 +867,7 @@ async function handleChatCompletions(req, res) {
       upstream.status === 401
         ? " (free-pi sign-in expired — run `npx free-pi-cli@latest` to sign in again)"
         : upstream.status === 426
-          ? ` (proxy sent client version ${sentVersion}; run \`npx free-pi-cli@latest\` once so the CLI records its new version, or set FREEPI_CLIENT_VERSION)`
+          ? ` (proxy sent client version ${sentVersion} and could not self-heal; run \`npx free-pi-cli@latest\` once so the CLI records its new version, or set FREEPI_CLIENT_VERSION, or check connectivity to ${BASE})`
           : upstream.status === 429
             ? " (daily free-pi allowance spent — /usage in free-pi, or /buy-credits)"
             : "";
@@ -969,10 +1055,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, async () => {
+  await initClientVersion();
   const token = loadToken();
   console.log(`free-pi proxy  http://${HOST}:${PORT}/v1`);
   console.log(`  backend      ${BASE}`);
-  console.log(`  client ver   ${getClientVersion()} (from ${VERSION_FILE})`);
+  console.log(`  client ver   ${getClientVersion()} (backend min ${versionInfo.min ?? "?"}, latest ${versionInfo.latest ?? "?"})`);
   console.log(`  credentials  ${CREDENTIALS_PATH} (${token ? "signed in" : "NOT SIGNED IN — run npx free-pi-cli@latest"})`);
   console.log(`  session      ${SESSION_ID}`);
   console.log(`  auth         ${PROXY_API_KEY ? "PROXY_API_KEY required" : "open (binds to localhost only)"}`);
