@@ -708,7 +708,7 @@ function render(s) {
 var tokenBuilt = false;
 function renderToken(s) {
   var signedIn = s.status && s.status.signed_in;
-  if (tokenBuilt) { var line = document.getElementById("toksignin"); if (line) line.innerHTML = "<span>Signed in</span><span class=\"" + (signedIn ? "ok" : "bad") + "\">" + (signedIn ? "yes" : "NO") + "</span>"; return; } // built once - never rebuild, so auto-refresh cannot wipe typed input
+  if (tokenBuilt) { var line = document.getElementById("toksignin"); if (line) line.innerHTML = "<span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span>"; return; } // built once - never rebuild, so auto-refresh cannot wipe typed input
   document.getElementById("token").innerHTML =
     "<div id=\\"toksignin\\" class=\\"kv\\"><span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span></div>" +
     "<div id=\\"tokacct\\" class=\\"muted\\" style=\\"font-size:12px;margin:4px 0\\"></div>" +
