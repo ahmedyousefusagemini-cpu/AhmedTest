@@ -4,3 +4,5 @@ client-version-state.json
 _patch*
 _envcheck*
 *.log
+proxy.mjs
+mcp.mjs
