@@ -705,10 +705,12 @@ function render(s) {
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString() + " — day " + (u.day || "?");
   renderToken(s);
 }
+var tokenBuilt = false;
 function renderToken(s) {
   var signedIn = s.status && s.status.signed_in;
+  if (tokenBuilt) { var line = document.getElementById("toksignin"); if (line) line.innerHTML = "<span>Signed in</span><span class=\"" + (signedIn ? "ok" : "bad") + "\">" + (signedIn ? "yes" : "NO") + "</span>"; return; } // built once - never rebuild, so auto-refresh cannot wipe typed input
   document.getElementById("token").innerHTML =
-    "<div class=\\"kv\\"><span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span></div>" +
+    "<div id=\\"toksignin\\" class=\\"kv\\"><span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span></div>" +
     "<div id=\\"tokacct\\" class=\\"muted\\" style=\\"font-size:12px;margin:4px 0\\"></div>" +
     "<div style=\\"margin:8px 0 4px\\" class=\\"muted\\">Proxy API key (saved in this browser):</div>" +
     "<input id=\\"pkey\\" type=\\"password\\" placeholder=\\"PROXY_API_KEY (leave empty if none set)\\" style=\\"width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px\\">" +
@@ -719,7 +721,7 @@ function renderToken(s) {
     "<span id=\\"tokmsg\\" class=\\"muted\\" style=\\"margin-left:10px;font-size:12px\\"></span>";
   var keyInput = document.getElementById("pkey");
   keyInput.value = localStorage.getItem("freepi_proxy_key") || "";
-  keyInput.onchange = function() { localStorage.setItem("freepi_proxy_key", keyInput.value.trim()); };
+  keyInput.oninput = function() { localStorage.setItem("freepi_proxy_key", keyInput.value.trim()); };
   var acctLine = document.getElementById("tokacct");
   var fmtAcct = function(a) {
     if (!a) return "";
@@ -747,6 +749,7 @@ function renderToken(s) {
   };
   document.getElementById("check").onclick = function() { post(true); };
   document.getElementById("save").onclick = function() { post(false); };
+  tokenBuilt = true;
 }
 function refresh() { fetch("/stats", { headers: hdrs() }).then(function(r){return r.json();}).then(render).catch(function(){}); }
 refresh(); setInterval(refresh, 5000);
