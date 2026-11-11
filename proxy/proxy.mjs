@@ -166,6 +166,7 @@ function statsSnapshot() {
       uptime_seconds: secs,
       mcp_servers: [...mcp.servers.entries()].map(([name, { tools }]) => ({ name, tools: tools.length })),
     },
+    ad: lastAd && Date.now() - lastAd.at < 600000 ? lastAd.ad : null,
     allowance: allowance.data && Date.now() - allowance.at < 300000
       ? {
           tier: allowance.data.tier,
@@ -314,11 +315,12 @@ function loadToken() {
   return credCache.token;
 }
 
-function upstreamHeaders(token) {
+function upstreamHeaders(token, turnId) {
   return {
     authorization: `Bearer ${token}`,
     "x-session-id": SESSION_ID,
     "x-client-version": getClientVersion(),
+    ...(turnId ? { "x-turn-id": turnId } : {}),
     "content-type": "application/json",
   };
 }
@@ -571,10 +573,10 @@ function isMcpTool(name) {
 }
 
 // Run upstream chat completions against the backend with explicit body.
-async function upstreamCall(token, upstreamBody) {
+async function upstreamCall(token, upstreamBody, turnId) {
   return fetch(`${BASE}/v1/chat/completions`, {
     method: "POST",
-    headers: upstreamHeaders(token),
+    headers: upstreamHeaders(token, turnId),
     body: JSON.stringify(upstreamBody),
   });
 }
@@ -582,13 +584,13 @@ async function upstreamCall(token, upstreamBody) {
 // When MCP tools are active, run a server-side agentic loop: execute
 // mcp__* tool calls ourselves and feed results back until the model answers
 // or calls a client-owned tool (which is returned to the client untouched).
-async function runWithMcp(token, upstreamBody, wantsStream, res) {
+async function runWithMcp(token, upstreamBody, wantsStream, res, turnId) {
   const messages = [...upstreamBody.messages];
   let final = null;
   for (let iter = 0; iter < MCP_MAX_ITERATIONS; iter++) {
     let resp;
     try {
-      resp = await upstreamCall(token, { ...upstreamBody, messages, stream: false });
+      resp = await upstreamCall(token, { ...upstreamBody, messages, stream: false }, turnId);
     } catch (err) {
       return json(res, 502, openAIError(`Cannot reach free-pi backend: ${err.message}`, "api_error"));
     }
@@ -707,6 +709,7 @@ function render(s) {
     : "<span class=\\"muted\\">no requests yet today</span>";
   document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString() + " — day " + (u.day || "?");
   renderToken(s);
+  renderAd(s.ad);
 }
 var tokenBuilt = false;
 function renderToken(s) {
@@ -773,40 +776,23 @@ function renderToken(s) {
   document.getElementById("save").onclick = function() { post(false); };
   tokenBuilt = true;
 }
-var lastAdAt = 0;
+var shownAdId = null;
 function ea(s) { return esc(s).replace(/"/g, "&quot;"); }
-function maybeFetchAd() {
-  if (document.hidden) return; // only fetch ads the user can actually see
-  lastAdAt = Date.now();
-  fetch("/ads/next?slot=banner", { headers: hdrs() })
-    .then(function(r) { return r.json(); })
-    .then(function(j) {
-      var el = document.getElementById("adcard");
-      if (!el) return;
-      if (!j || !j.ad) { el.innerHTML = "<span class=\\"muted\\">no ad available right now</span>"; return; }
-      var c = j.ad.creative || {};
-      var imp = j.ad.imp_url ? "<img id=\\"adimp\\" src=\\"" + ea(j.ad.imp_url) + "\\" width=\\"1\\" height=\\"1\\" alt=\\"\\" style=\\"border:0\\">" : "";
-      el.innerHTML =
-        "<div style=\\"font-weight:600\\">" + esc(c.brand_name || c.headline || "") + "</div>" +
-        "<div style=\\"margin:2px 0\\">" + esc(c.headline || "") + "</div>" +
-        "<div class=\\"muted\\" style=\\"margin:4px 0\\">" + esc(c.body || "") + "</div>" +
-        "<a href=\\"" + ea(j.ad.click_url) + "\\" target=\\"_blank\\" rel=\\"noopener\\" style=\\"color:#58a6ff;background:#21262d;border-radius:6px;padding:4px 10px;display:inline-block;text-decoration:none\\">" + esc(c.cta || "Learn more") + "</a>" +
-        imp;
-      var report = function(impFired) {
-        fetch("/ads/impression", { method: "POST", headers: Object.assign({ "content-type": "application/json" }, hdrs()), body: JSON.stringify({ ad_id: j.ad.ad_id, click_token: j.ad.click_token, imp_fired: !!impFired }) }).catch(function() {});
-      };
-      var img = document.getElementById("adimp");
-      if (img) {
-        var done = false;
-        var once = function(f) { if (!done) { done = true; report(f); } };
-        img.onload = function() { once(true); };
-        img.onerror = function() { once(false); };
-        setTimeout(function() { once(false); }, 3000);
-      } else report(false);
-    })
-    .catch(function() {});
+function renderAd(ad) {
+  var el = document.getElementById("adcard");
+  if (!el) return;
+  if (!ad) { if (shownAdId !== null) { shownAdId = null; el.innerHTML = "<span class=\\"muted\\">no ad yet — ads appear here as the proxy serves requests</span>"; } return; }
+  if (ad.ad_id === shownAdId) return;
+  shownAdId = ad.ad_id;
+  var c = ad.creative || {};
+  el.innerHTML =
+    "<div style=\\"font-weight:600\\">" + esc(c.brand_name || c.headline || "") + "</div>" +
+    "<div style=\\"margin:2px 0\\">" + esc(c.headline || "") + "</div>" +
+    "<div class=\\"muted\\" style=\\"margin:4px 0\\">" + esc(c.body || "") + "</div>" +
+    "<a href=\\"" + ea(ad.click_url) + "\\" target=\\"_blank\\" rel=\\"noopener\\" style=\\"color:#58a6ff;background:#21262d;border-radius:6px;padding:4px 10px;display:inline-block;text-decoration:none\\">" + esc(c.cta || "Learn more") + "</a>" +
+    "<div class=\\"muted\\" style=\\"margin-top:4px;font-size:11px\\">shown in exchange for proxy usage, like the CLI</div>";
 }
-function refresh() { fetch("/stats", { headers: hdrs() }).then(function(r){return r.json();}).then(render).catch(function(){}); if (Date.now() - lastAdAt > 300000) maybeFetchAd(); }
+function refresh() { fetch("/stats", { headers: hdrs() }).then(function(r){return r.json();}).then(render).catch(function(){}); }
 refresh(); setInterval(refresh, 5000);
 </script></body></html>`;
 
@@ -817,13 +803,13 @@ refresh(); setInterval(refresh, 5000);
 // same contract as the CLI, where the ad is shown to the user before it counts.
 let currentAd = null;
 
-async function fetchAdFromBackend(slot, trigger) {
+async function fetchAdFromBackend(slot, trigger, turnId) {
   const token = loadToken();
   if (!token) return null;
   try {
     const res = await fetch(`${BASE}/ads/next?slot=${encodeURIComponent(slot)}`, {
       headers: {
-        ...upstreamHeaders(token),
+        ...upstreamHeaders(token, turnId),
         "x-client-os": process.platform,
         "x-client-arch": os.arch(),
         ...(trigger ? { "x-ad-trigger": trigger } : {}),
@@ -849,6 +835,38 @@ async function postAdImpressionToBackend(body) {
   } catch {
     return false;
   }
+}
+
+// Per-turn ad cycle, matching the CLI exactly: on each user message the CLI
+// fetches a banner ad (trigger "user_message", fresh x-turn-id, >=60s between
+// fetches), fires the gravity impression pixel, and reports the impression —
+// with the ad rendered to the user. Here the ad is rendered in the dashboard.
+const BANNER_MIN_REFRESH_MS = 60 * 1000;
+function isGravityImpUrl(raw) {
+  if (!raw) return false;
+  try {
+    const u = new URL(raw);
+    return u.protocol === "https:" && /(^|\.)trygravity\.(ai|com)$/.test(u.hostname);
+  } catch {
+    return false;
+  }
+}
+let lastAd = null; // { ad, at }
+let adInFlight = null;
+async function maybeShowAd(turnId) {
+  if (Date.now() - (lastAd ? lastAd.at : 0) < BANNER_MIN_REFRESH_MS) return;
+  if (adInFlight) return adInFlight;
+  adInFlight = (async () => {
+    const ad = await fetchAdFromBackend("banner", "user_message", turnId);
+    if (!ad) return;
+    lastAd = { ad, at: Date.now() };
+    let impFired = false;
+    if (ad.source === "gravity" && isGravityImpUrl(ad.imp_url)) {
+      impFired = await fetch(ad.imp_url, { signal: AbortSignal.timeout(3000) }).then((r) => r.ok).catch(() => false);
+    }
+    await postAdImpressionToBackend({ ad_id: ad.ad_id, click_token: ad.click_token, ...(impFired ? { imp_fired: true } : {}) });
+  })().catch(() => {}).finally(() => { adInFlight = null; });
+  return adInFlight;
 }
 
 // ---------- proxy core ----------
@@ -919,12 +937,17 @@ async function handleChatCompletions(req, res) {
     ));
   }
 
+  // One ad cycle per user message, exactly like the CLI: new turn id, banner
+  // ad (>=60s refresh), impression reported, same turn id on the chat call.
+  const turnId = crypto.randomUUID();
+  await maybeShowAd(turnId);
+
   // MCP servers connected? Inject their tools and run the server-side loop.
   const mcpTools = useMcp && MCP_MODE !== "off" && mcp.connected() ? mcp.toOpenAITools() : [];
   if (mcpTools.length) {
     const have = new Set((upstreamBody.tools ?? []).map((t) => t.function?.name).filter(Boolean));
     upstreamBody.tools = [...(upstreamBody.tools ?? []), ...mcpTools.filter((t) => !have.has(t.function.name))];
-    return runWithMcp(token, upstreamBody, wantsStream, res);
+    return runWithMcp(token, upstreamBody, wantsStream, res, turnId);
   }
 
   const sentVersion = getClientVersion();
@@ -932,7 +955,7 @@ async function handleChatCompletions(req, res) {
   try {
     upstream = await fetch(`${BASE}/v1/chat/completions`, {
       method: "POST",
-      headers: upstreamHeaders(token),
+      headers: upstreamHeaders(token, turnId),
       body: JSON.stringify(upstreamBody),
     });
   } catch (err) {
@@ -949,7 +972,7 @@ async function handleChatCompletions(req, res) {
     if (fresh && (fresh !== token || freshVersion !== sentVersion)) {
       upstream = await fetch(`${BASE}/v1/chat/completions`, {
         method: "POST",
-        headers: upstreamHeaders(fresh),
+        headers: upstreamHeaders(fresh, turnId),
         body: JSON.stringify(upstreamBody),
       });
     }
