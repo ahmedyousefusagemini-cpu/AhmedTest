@@ -151,11 +151,13 @@ function syncTokenToGithub() {
   });
 }
 
+function tokenFp(t) { return t ? t.length + " chars, ends ..." + t.slice(-8) : "none"; }
 function statsSnapshot() {
   const secs = Math.floor((Date.now() - STARTED_AT) / 1000);
   return {
     status: {
       signed_in: Boolean(loadToken()),
+      token_fp: tokenFp(loadToken()),
       backend: BASE,
       client_version: getClientVersion(),
       session: SESSION_ID.slice(0, 14) + "…",
@@ -708,10 +710,17 @@ function render(s) {
 var tokenBuilt = false;
 function renderToken(s) {
   var signedIn = s.status && s.status.signed_in;
-  if (tokenBuilt) { var line = document.getElementById("toksignin"); if (line) line.innerHTML = "<span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span>"; return; } // built once - never rebuild, so auto-refresh cannot wipe typed input
+  if (tokenBuilt) {
+    var line = document.getElementById("toksignin");
+    if (line) line.innerHTML = "<span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span>";
+    var fpEl = document.getElementById("tokfp");
+    if (fpEl) fpEl.textContent = "In use: " + ((s.status && s.status.token_fp) || "?");
+    return; // built once - never rebuild, so auto-refresh cannot wipe typed input
+  }
   document.getElementById("token").innerHTML =
     "<div id=\\"toksignin\\" class=\\"kv\\"><span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span></div>" +
     "<div id=\\"tokacct\\" class=\\"muted\\" style=\\"font-size:12px;margin:4px 0\\"></div>" +
+    "<div id=\\"tokfp\\" class=\\"muted\\" style=\\"font-size:12px;margin:2px 0\\"></div>" +
     "<div style=\\"margin:8px 0 4px\\" class=\\"muted\\">Proxy API key (saved in this browser):</div>" +
     "<input id=\\"pkey\\" type=\\"text\\" placeholder=\\"PROXY_API_KEY (leave empty if none set)\\" style=\\"width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px;font-family:monospace\\">" +
     "<span id=\\"pkeystatus\\" class=\\"muted\\" style=\\"font-size:12px\\"></span>" +
@@ -1045,10 +1054,10 @@ const server = http.createServer(async (req, res) => {
       account: accountInfo,
       github_sync: sync,
       message: sync.ok
-        ? `Token validated and saved. GitHub secret ${sync.secret} updated.`
+        ? `Token validated and saved \u2014 now in use: ${tokenFp(token)}. GitHub secret ${sync.secret} updated.`
         : sync.attempted
-          ? `Token validated and saved, but GitHub sync failed: ${sync.detail}`
-          : "Token validated and saved (GitHub sync not configured).",
+          ? `Token validated and saved \u2014 now in use: ${tokenFp(token)} \u2014 but GitHub sync failed: ${sync.detail}`
+          : `Token validated and saved \u2014 now in use: ${tokenFp(token)} (GitHub sync not configured).`,
     });
   }
 
