@@ -167,6 +167,7 @@ function statsSnapshot() {
       mcp_servers: [...mcp.servers.entries()].map(([name, { tools }]) => ({ name, tools: tools.length })),
     },
     ad: lastAd && Date.now() - lastAd.at < 600000 ? lastAd.ad : null,
+    ad_debug: adDebug,
     allowance: allowance.data && Date.now() - allowance.at < 300000
       ? {
           tier: allowance.data.tier,
@@ -815,9 +816,11 @@ async function fetchAdFromBackend(slot, trigger, turnId) {
         ...(trigger ? { "x-ad-trigger": trigger } : {}),
       },
     });
+    adDebug.fetch_status = res.status;
     if (res.status === 204 || !res.ok) return null;
     return await res.json();
-  } catch {
+  } catch (err) {
+    adDebug.last_error = "fetch: " + err.message;
     return null;
   }
 }
@@ -831,8 +834,10 @@ async function postAdImpressionToBackend(body) {
       headers: upstreamHeaders(token),
       body: JSON.stringify(body),
     });
+    adDebug.imp_status = res.status;
     return res.ok;
-  } catch {
+  } catch (err) {
+    adDebug.last_error = "impression: " + err.message;
     return false;
   }
 }
@@ -841,7 +846,6 @@ async function postAdImpressionToBackend(body) {
 // fetches a banner ad (trigger "user_message", fresh x-turn-id, >=60s between
 // fetches), fires the gravity impression pixel, and reports the impression —
 // with the ad rendered to the user. Here the ad is rendered in the dashboard.
-const BANNER_MIN_REFRESH_MS = 60 * 1000;
 function isGravityImpUrl(raw) {
   if (!raw) return false;
   try {
@@ -852,19 +856,41 @@ function isGravityImpUrl(raw) {
   }
 }
 let lastAd = null; // { ad, at }
+let launchAdAt = 0; // when the session-start ("launch") ad was fetched
+let lastPostedToken = null; // CLI semantics: only impression NEW click_tokens
 let adInFlight = null;
-async function maybeShowAd(turnId) {
-  if (Date.now() - (lastAd ? lastAd.at : 0) < BANNER_MIN_REFRESH_MS) return;
+const adDebug = { fetch_status: null, imp_status: null, dup_polls: 0, last_error: null };
+// Per-message ad cycle, matching the CLI: every user message fetches a banner
+// ad (trigger "user_message"; "launch" for the first ad of a session) and only
+// NEW ads (new click_token) are impressed — the CLI does the same via
+// lastPostedToken. The backend serves a new ad at most once per ~20s and
+// pauses requests whose turn has no fresh ad, so poll briefly for one; the ad
+// is displayed in the dashboard the whole time.
+const AD_POLL_MAX_MS = 45000;
+const AD_POLL_INTERVAL_MS = 3000;
+async function maybeShowAd(turnId, trigger) {
+  if (!trigger) trigger = launchAdAt === 0 ? "launch" : "user_message";
   if (adInFlight) return adInFlight;
   adInFlight = (async () => {
-    const ad = await fetchAdFromBackend("banner", "user_message", turnId);
-    if (!ad) return;
-    lastAd = { ad, at: Date.now() };
-    let impFired = false;
-    if (ad.source === "gravity" && isGravityImpUrl(ad.imp_url)) {
-      impFired = await fetch(ad.imp_url, { signal: AbortSignal.timeout(3000) }).then((r) => r.ok).catch(() => false);
+    const deadline = Date.now() + AD_POLL_MAX_MS;
+    for (;;) {
+      const ad = await fetchAdFromBackend("banner", trigger, turnId);
+      if (!ad) return;
+      if (ad.click_token !== lastPostedToken) {
+        lastAd = { ad, at: Date.now() };
+        if (trigger === "launch") launchAdAt = Date.now();
+        lastPostedToken = ad.click_token;
+        let impFired = false;
+        if (ad.source === "gravity" && isGravityImpUrl(ad.imp_url)) {
+          impFired = await fetch(ad.imp_url, { signal: AbortSignal.timeout(3000) }).then((r) => r.ok).catch(() => false);
+        }
+        await postAdImpressionToBackend({ ad_id: ad.ad_id, click_token: ad.click_token, ...(impFired ? { imp_fired: true } : {}) });
+        return;
+      }
+      adDebug.dup_polls += 1;
+      if (Date.now() >= deadline) { lastAd = { ad, at: Date.now() }; return; }
+      await new Promise((r) => setTimeout(r, AD_POLL_INTERVAL_MS));
     }
-    await postAdImpressionToBackend({ ad_id: ad.ad_id, click_token: ad.click_token, ...(impFired ? { imp_fired: true } : {}) });
   })().catch(() => {}).finally(() => { adInFlight = null; });
   return adInFlight;
 }
