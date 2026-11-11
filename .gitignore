@@ -1,0 +1,6 @@
+usage-stats.json
+model-specs-cache.json
+client-version-state.json
+_patch*
+_envcheck*
+*.log
