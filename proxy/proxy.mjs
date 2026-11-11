@@ -658,6 +658,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="card"><h3>free-pi allowance today</h3><div id="allowance"></div></div>
   <div class="card"><h3>Tokens today</h3><div id="today"></div></div>
 <div class="card"><h3>free-pi token</h3><div id="token"></div></div>
+<div class="card"><h3>Sponsor</h3><div id="adcard" class="muted" style="font-size:13px">loading…</div></div>
 </div>
 <div class="card"><h3>Per model (today)</h3><div id="models"></div></div>
 <p class="muted">Auto-refreshes every 5s. All-time totals included in /stats.</p>
@@ -772,9 +773,83 @@ function renderToken(s) {
   document.getElementById("save").onclick = function() { post(false); };
   tokenBuilt = true;
 }
-function refresh() { fetch("/stats", { headers: hdrs() }).then(function(r){return r.json();}).then(render).catch(function(){}); }
+var lastAdAt = 0;
+function ea(s) { return esc(s).replace(/"/g, "&quot;"); }
+function maybeFetchAd() {
+  if (document.hidden) return; // only fetch ads the user can actually see
+  lastAdAt = Date.now();
+  fetch("/ads/next?slot=banner", { headers: hdrs() })
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      var el = document.getElementById("adcard");
+      if (!el) return;
+      if (!j || !j.ad) { el.innerHTML = "<span class=\\"muted\\">no ad available right now</span>"; return; }
+      var c = j.ad.creative || {};
+      var imp = j.ad.imp_url ? "<img id=\\"adimp\\" src=\\"" + ea(j.ad.imp_url) + "\\" width=\\"1\\" height=\\"1\\" alt=\\"\\" style=\\"border:0\\">" : "";
+      el.innerHTML =
+        "<div style=\\"font-weight:600\\">" + esc(c.brand_name || c.headline || "") + "</div>" +
+        "<div style=\\"margin:2px 0\\">" + esc(c.headline || "") + "</div>" +
+        "<div class=\\"muted\\" style=\\"margin:4px 0\\">" + esc(c.body || "") + "</div>" +
+        "<a href=\\"" + ea(j.ad.click_url) + "\\" target=\\"_blank\\" rel=\\"noopener\\" style=\\"color:#58a6ff;background:#21262d;border-radius:6px;padding:4px 10px;display:inline-block;text-decoration:none\\">" + esc(c.cta || "Learn more") + "</a>" +
+        imp;
+      var report = function(impFired) {
+        fetch("/ads/impression", { method: "POST", headers: Object.assign({ "content-type": "application/json" }, hdrs()), body: JSON.stringify({ ad_id: j.ad.ad_id, click_token: j.ad.click_token, imp_fired: !!impFired }) }).catch(function() {});
+      };
+      var img = document.getElementById("adimp");
+      if (img) {
+        var done = false;
+        var once = function(f) { if (!done) { done = true; report(f); } };
+        img.onload = function() { once(true); };
+        img.onerror = function() { once(false); };
+        setTimeout(function() { once(false); }, 3000);
+      } else report(false);
+    })
+    .catch(function() {});
+}
+function refresh() { fetch("/stats", { headers: hdrs() }).then(function(r){return r.json();}).then(render).catch(function(){}); if (Date.now() - lastAdAt > 300000) maybeFetchAd(); }
 refresh(); setInterval(refresh, 5000);
 </script></body></html>`;
+
+// ---------- ads (shown in the dashboard; the browser fires impressions on real display) ----------
+
+// Ads are fetched only when an open dashboard asks for one, and the impression
+// pixel is loaded by the user's browser when the ad is actually rendered — the
+// same contract as the CLI, where the ad is shown to the user before it counts.
+let currentAd = null;
+
+async function fetchAdFromBackend(slot, trigger) {
+  const token = loadToken();
+  if (!token) return null;
+  try {
+    const res = await fetch(`${BASE}/ads/next?slot=${encodeURIComponent(slot)}`, {
+      headers: {
+        ...upstreamHeaders(token),
+        "x-client-os": process.platform,
+        "x-client-arch": os.arch(),
+        ...(trigger ? { "x-ad-trigger": trigger } : {}),
+      },
+    });
+    if (res.status === 204 || !res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function postAdImpressionToBackend(body) {
+  const token = loadToken();
+  if (!token) return false;
+  try {
+    const res = await fetch(`${BASE}/ads/impression`, {
+      method: "POST",
+      headers: upstreamHeaders(token),
+      body: JSON.stringify(body),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
 
 // ---------- proxy core ----------
 
@@ -1059,6 +1134,34 @@ const server = http.createServer(async (req, res) => {
           ? `Token validated and saved \u2014 now in use: ${tokenFp(token)} \u2014 but GitHub sync failed: ${sync.detail}`
           : `Token validated and saved \u2014 now in use: ${tokenFp(token)} (GitHub sync not configured).`,
     });
+  }
+
+  // Fetch an ad to display in the dashboard (only called by an open dashboard).
+  if (p === "/ads/next" && req.method === "GET") {
+    if (!checkAuth(req, res)) return;
+    const slot = url.searchParams.get("slot") === "inline" ? "inline" : "banner";
+    const trigger = url.searchParams.get("trigger") || undefined;
+    const ad = await fetchAdFromBackend(slot, trigger);
+    if (!ad) return json(res, 200, { ad: null, slot });
+    currentAd = { ad, at: Date.now(), slot };
+    return json(res, 200, { ad, slot });
+  }
+
+  // Report an impression after the dashboard actually displayed the ad.
+  if (p === "/ads/impression" && req.method === "POST") {
+    if (!checkAuth(req, res)) return;
+    const raw = await readBody(req);
+    let body = {};
+    try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
+    if (!body.ad_id || !body.click_token) {
+      return json(res, 400, openAIError("ad_id and click_token are required."));
+    }
+    const ok = await postAdImpressionToBackend({
+      ad_id: String(body.ad_id),
+      click_token: String(body.click_token),
+      ...(body.imp_fired ? { imp_fired: true } : {}),
+    });
+    return json(res, ok ? 200 : 502, { ok });
   }
 
   if (p === "/health") {
