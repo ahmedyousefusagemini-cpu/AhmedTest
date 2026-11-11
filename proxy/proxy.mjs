@@ -713,7 +713,8 @@ function renderToken(s) {
     "<div id=\\"toksignin\\" class=\\"kv\\"><span>Signed in</span><span class=\\"" + (signedIn ? "ok" : "bad") + "\\">" + (signedIn ? "yes" : "NO") + "</span></div>" +
     "<div id=\\"tokacct\\" class=\\"muted\\" style=\\"font-size:12px;margin:4px 0\\"></div>" +
     "<div style=\\"margin:8px 0 4px\\" class=\\"muted\\">Proxy API key (saved in this browser):</div>" +
-    "<input id=\\"pkey\\" type=\\"password\\" placeholder=\\"PROXY_API_KEY (leave empty if none set)\\" style=\\"width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px\\">" +
+    "<input id=\\"pkey\\" type=\\"text\\" placeholder=\\"PROXY_API_KEY (leave empty if none set)\\" style=\\"width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px;font-family:monospace\\">" +
+    "<span id=\\"pkeystatus\\" class=\\"muted\\" style=\\"font-size:12px\\"></span>" +
     "<div style=\\"margin:8px 0 4px\\" class=\\"muted\\">Paste credentials.json contents (or just the token string) from any machine:</div>" +
     "<textarea id=\\"tok\\" rows=\\"3\\" placeholder=\\"{&quot;token&quot;:&quot;...&quot;}\\" style=\\"width:100%;box-sizing:border-box;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;padding:6px;font-family:monospace;font-size:11px\\"></textarea>" +
     "<button id=\\"check\\" style=\\"margin-top:8px;background:#30363d;color:#e6edf3;border:1px solid #8b949e;border-radius:6px;padding:6px 14px;cursor:pointer;margin-right:6px\\">Check</button>" +
@@ -722,6 +723,17 @@ function renderToken(s) {
   var keyInput = document.getElementById("pkey");
   keyInput.value = localStorage.getItem("freepi_proxy_key") || "";
   keyInput.oninput = function() { localStorage.setItem("freepi_proxy_key", keyInput.value.trim()); };
+  var probeKey = function() {
+    fetch("/token", { method: "POST", headers: Object.assign({ "content-type": "application/json" }, hdrs()), body: "{}" })
+      .then(function(r) {
+        var el = document.getElementById("pkeystatus");
+        if (!el) return;
+        if (r.status === 400) el.innerHTML = "<span class=\\"ok\\">\u2713 proxy key accepted</span>";
+        else if (r.status === 401) el.innerHTML = "<span class=\\"bad\\">\u2717 key missing or wrong \u2014 enter the proxy's PROXY_API_KEY above</span>";
+      }).catch(function() {});
+  };
+  probeKey();
+  keyInput.addEventListener("input", function() { clearTimeout(probeKey._t); probeKey._t = setTimeout(probeKey, 400); });
   var acctLine = document.getElementById("tokacct");
   var fmtAcct = function(a) {
     if (!a) return "";
