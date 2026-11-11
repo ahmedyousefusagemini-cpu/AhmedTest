@@ -994,6 +994,7 @@ const server = http.createServer(async (req, res) => {
         else if (typeof parsed?.jwt === "string") token = parsed.jwt.trim();
       }
     } catch { /* plain token string */ }
+    token = token.replace(/\s+/g, ""); // strip line wraps / stray whitespace inside pasted JWTs
     const checkOnly = body.check_only === true;
     if (!token || token.length < 20) {
       return json(res, 400, openAIError("Paste the contents of credentials.json or the raw token string."));
@@ -1004,7 +1005,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const check = await fetch(`${BASE}/me`, { headers: upstreamHeaders(token) });
       if (!check.ok) {
-        return json(res, 401, openAIError(`Token rejected by free-pi backend (HTTP ${check.status}). Not saved.`, "authentication_error"));
+        return json(res, 401, openAIError(`Token rejected by free-pi backend (HTTP ${check.status}). Not saved. [pasted token: ${token.length} chars, ends ...${token.slice(-8)}]`, "authentication_error"));
       }
       try { account = await check.json(); } catch {}
     } catch (err) {
