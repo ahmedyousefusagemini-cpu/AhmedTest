@@ -985,6 +985,8 @@ const server = http.createServer(async (req, res) => {
     const raw = await readBody(req);
     let body = {};
     let token = raw.toString("utf8").trim();
+    // normalize smart quotes that chat apps / editors inject into pasted JSON
+    token = token.replace(/[\u201c\u201d\u201e\u201f]/g, '"').replace(/[\u2018\u2019]/g, "'");
     try {
       const parsed = JSON.parse(token);
       if (typeof parsed === "string") token = parsed.trim();
@@ -994,6 +996,11 @@ const server = http.createServer(async (req, res) => {
         else if (typeof parsed?.jwt === "string") token = parsed.jwt.trim();
       }
     } catch { /* plain token string */ }
+    // fallback: extract the JWT from a mangled paste (prose, partial JSON, wrapped text)
+    if (!/^eyJ[A-Za-z0-9_-]+\./.test(token)) {
+      const m = token.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+      if (m) token = m[0];
+    }
     token = token.replace(/\s+/g, ""); // strip line wraps / stray whitespace inside pasted JWTs
     const checkOnly = body.check_only === true;
     if (!token || token.length < 20) {
