@@ -54,6 +54,30 @@ const BUILT_IN_SPECS = {
 const REASONING_EFFORT = process.env.FREEPI_PROXY_REASONING || "high";
 // FREEPI_PROXY_FORCE=1 also overrides a client's own (smaller) choices.
 const FORCE_MAXIMA = process.env.FREEPI_PROXY_FORCE === "1";
+
+// Default max_tokens when the client sends none. free-pi's per-model max output
+// is huge (glm-5.3-flash: 131,072 / deepseek-v4.1-flash: 943,718) and the
+// backend counts prompt + requested output against the model window, so
+// reserving the whole output budget turns otherwise-fine requests into HTTP 413
+// "context_too_long". The fallback therefore stays modest; override with
+// FREEPI_PROXY_MAX_DEFAULT_OUTPUT, or set FREEPI_PROXY_FORCE=1 to go maximal.
+const MAX_DEFAULT_OUTPUT = Number(process.env.FREEPI_PROXY_MAX_DEFAULT_OUTPUT || 32768);
+
+// Context-overflow recovery ("This conversation is too long — run /compact or
+// start a new session with /new", HTTP 413 / code `context_too_long`).
+// The proxy forwards the client's history untouched, so once a conversation
+// outgrows the model window every following turn fails the same way. Instead of
+// failing forever, drop the oldest turns (keeping the system prompt and the
+// newest turns), retry, and repeat until the backend accepts the request — the
+// proxy-side equivalent of /compact. Tunables:
+//   FREEPI_PROXY_COMPACT_TRIES       retries after a 413 (default 4)
+//   FREEPI_PROXY_COMPACT_KEEP_RATIO  history shrinks to this fraction (0.5)
+//   FREEPI_PROXY_COMPACT_MIN_TOKENS  floor for the post-trim estimate (8000)
+const COMPACT_MAX_TRIES = Number(process.env.FREEPI_PROXY_COMPACT_TRIES || 4);
+const COMPACT_KEEP_RATIO = Number(process.env.FREEPI_PROXY_COMPACT_KEEP_RATIO || 0.5);
+const COMPACT_MIN_TOKENS = Number(process.env.FREEPI_PROXY_COMPACT_MIN_TOKENS || 8000);
+const COMPACT_NOTE =
+  "[proxy] Earlier messages were removed automatically so the conversation fits the model's context window. Ask the user to re-send anything essential from the trimmed part if it is still needed.";
 const CREDENTIALS_PATH =
   process.env.FREEPI_CREDENTIALS_PATH || path.join(os.homedir(), ".free-pi", "agent", "credentials.json");
 
@@ -440,7 +464,7 @@ async function fetchCatalog() {
   } catch {
     /* keep stale cache */
   }
-  return catalogCache.models ?? [{ id: FALLBACK_MODEL, name: FALLBACK_MODEL }];
+  return catalogCache.models ?? [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }];
 }
 
 function toOpenAIModel(m) {
@@ -468,10 +492,12 @@ function toOpenAIModel(m) {
 // Fill in maximum context / reasoning settings.
 //  - reasoning_effort: inject REASONING_EFFORT when the client sends none
 //    (or always, with FREEPI_PROXY_FORCE=1)
-//  - max_tokens: default to MAX_OUTPUT_TOKENS when the client sends none
-//    (or raise smaller values, with FREEPI_PROXY_FORCE=1)
-// Message content is never touched: the full context the client sends is
-// forwarded as-is (the backend window is CONTEXT_WINDOW).
+//  - max_tokens: default to MAX_DEFAULT_OUTPUT when the client sends none
+//    (or raise smaller values to the model max, with FREEPI_PROXY_FORCE=1)
+// Message content is never rewritten here: the body the client sends is
+// forwarded as-is, except for context-overflow compaction (see
+// fetchUpstreamWithCompaction) which only kicks in after the backend says the
+// conversation is too long.
 function applyMaxima(body) {
   const out = { ...body };
   return fetchModelSpecs().then((specs) => {
@@ -480,7 +506,10 @@ function applyMaxima(body) {
     if (REASONING_EFFORT !== "client") {
       if (out.reasoning_effort == null || FORCE_MAXIMA) out.reasoning_effort = REASONING_EFFORT;
     }
-    if (out.max_tokens == null) out.max_tokens = maxOut;
+    // Never reserve more output than a client actually asked for (or than
+    // MAX_DEFAULT_OUTPUT) unless FORCE_MAXIMA is set: prompt + reserved output
+    // is what the backend measures against the context window.
+    if (out.max_tokens == null) out.max_tokens = Math.min(maxOut, MAX_DEFAULT_OUTPUT);
     else if (FORCE_MAXIMA && out.max_tokens < maxOut) out.max_tokens = maxOut;
     return out;
   });
@@ -552,6 +581,130 @@ function normalizeBody(body) {
   return out;
 }
 
+// ---------- context-overflow recovery ----------
+
+// Rough token estimate (chars/4 for text, a flat cost for media). It only
+// decides which turns to drop; the backend stays the authority, so anything we
+// think is fine is still sent as-is first.
+function estimateTokens(value) {
+  if (value == null) return 0;
+  if (typeof value === "string") return Math.ceil(value.length / 4);
+  if (typeof value !== "object") return 1;
+  if (Array.isArray(value)) return value.reduce((n, v) => n + estimateTokens(v), 0);
+  if (
+    value.type === "image_url" || value.type === "image" ||
+    value.type === "input_image" || value.type === "video_url"
+  ) {
+    return 1500;
+  }
+  let n = 0;
+  for (const v of Object.values(value)) n += estimateTokens(v);
+  return n;
+}
+
+const MESSAGE_OVERHEAD_TOKENS = 4;
+const estimateBodyTokens = (body) =>
+  estimateTokens(body?.messages) + estimateTokens(body?.tools) +
+  estimateTokens(body?.response_format) + 16;
+
+// Messages that mean "the prompt no longer fits the model window" — the backend
+// answers with HTTP 413 and code `context_too_long` ("This conversation is too
+// long — run /compact or start a new session with /new"). Mirrors free-pi-cli's
+// own overflow detection so we don't retry on quota/rate-limit errors.
+const OVERFLOW_PATTERNS = [
+  /context_too_long/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /prompt (?:is )?too long/i,
+  /prompt exceeds max length/i,
+  /request_too_large/i,
+  /input is too long/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length/i,
+  /exceeds the context window/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum context length is \d+ tokens/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+  /conversation is too long/i,
+];
+const NON_OVERFLOW_PATTERNS = [/rate limit/i, /too many requests/i, /model_at_capacity/i];
+
+function isContextOverflow(status, text) {
+  const msg = String(text || "");
+  if (NON_OVERFLOW_PATTERNS.some((p) => p.test(msg))) return false;
+  if (OVERFLOW_PATTERNS.some((p) => p.test(msg))) return true;
+  return status === 413; // bodyless 413 still means "payload too large"
+}
+
+// Drop the oldest turns until the request estimates <= budgetTokens. The system
+// prompt and the newest turn are always preserved and tool-call pairing is kept
+// valid by starting the retained tail on a user message.
+function compactBody(body, budgetTokens) {
+  const msgs = Array.isArray(body?.messages) ? body.messages : null;
+  if (!msgs || !msgs.length) return null;
+
+  const head = [];
+  let i = 0;
+  while (i < msgs.length && (msgs[i]?.role === "system" || msgs[i]?.role === "developer")) head.push(msgs[i++]);
+  const tail = msgs.slice(i);
+  if (!tail.length) return null;
+
+  let room = budgetTokens - estimateTokens(body.tools) - estimateTokens(body.response_format) - estimateTokens(head);
+  const kept = [];
+  for (let j = tail.length - 1; j >= 0; j--) {
+    const cost = estimateTokens(tail[j]) + MESSAGE_OVERHEAD_TOKENS;
+    if (kept.length && room - cost < 0) break;
+    kept.unshift(tail[j]);
+    room -= cost;
+  }
+  // Start on a user turn: never leave orphaned tool results behind.
+  while (kept.length > 1 && kept[0]?.role !== "user") kept.shift();
+  if (!kept.length) kept.push(tail[tail.length - 1]);
+
+  const dropped = msgs.length - head.length - kept.length;
+  if (dropped <= 0) return null;
+  return { ...body, messages: [...head, { role: "system", content: COMPACT_NOTE }, ...kept] };
+}
+
+// POST to the backend; on 413 / context-too-long shrink the history and retry.
+// Returns { resp, text, body, compacted, overflow }; `text` is set only when the
+// final response is not ok (its body has already been read).
+async function fetchUpstreamWithCompaction(token, upstreamBody, turnId) {
+  let body = upstreamBody;
+  let compacted = false;
+  for (let attempt = 0; ; attempt++) {
+    const resp = await upstreamCall(token, body, turnId);
+    if (resp.ok) return { resp, text: null, body, compacted };
+    const text = await resp.text().catch(() => "");
+    const overflow = isContextOverflow(resp.status, text);
+    if (!overflow) return { resp, text, body, compacted };
+    if (attempt >= COMPACT_MAX_TRIES) return { resp, text, body, compacted, overflow: true };
+
+    const before = estimateBodyTokens(body);
+    // Shrink to COMPACT_KEEP_RATIO of the current size, but never *above* it —
+    // the floor only applies while it leaves room to shrink.
+    const budget = Math.max(
+      Math.min(COMPACT_MIN_TOKENS, Math.floor(before * 0.5)),
+      Math.floor(before * COMPACT_KEEP_RATIO)
+    );
+    const next = compactBody(body, budget);
+    if (!next || estimateBodyTokens(next) >= before) {
+      return { resp, text, body, compacted, overflow: true };
+    }
+    let code = "";
+    try {
+      const parsed = JSON.parse(text);
+      code = parsed?.error?.code ?? parsed?.code ?? "";
+    } catch {}
+    console.log(
+      `[compact] backend refused (${resp.status}${code ? " " + code : ""}): ` +
+      `~${before} tokens -> ~${estimateBodyTokens(next)} ` +
+      `(${body.messages.length - next.messages.length} older message(s) dropped)`
+    );
+    compacted = true;
+    body = next;
+  }
+}
+
 // ---------- MCP agentic loop ----------
 
 function completionToSSE(completion) {
@@ -586,21 +739,25 @@ async function upstreamCall(token, upstreamBody, turnId) {
 // mcp__* tool calls ourselves and feed results back until the model answers
 // or calls a client-owned tool (which is returned to the client untouched).
 async function runWithMcp(token, upstreamBody, wantsStream, res, turnId) {
-  const messages = [...upstreamBody.messages];
+  let messages = [...upstreamBody.messages];
   let final = null;
+  let compacted = false;
   for (let iter = 0; iter < MCP_MAX_ITERATIONS; iter++) {
-    let resp;
+    let call;
     try {
-      resp = await upstreamCall(token, { ...upstreamBody, messages, stream: false }, turnId);
+      call = await fetchUpstreamWithCompaction(token, { ...upstreamBody, messages, stream: false }, turnId);
     } catch (err) {
       return json(res, 502, openAIError(`Cannot reach free-pi backend: ${err.message}`, "api_error"));
     }
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "");
-      return json(res, resp.status === 401 || resp.status === 429 ? resp.status : 502,
-        openAIError(`free-pi backend ${resp.status}: ${text.slice(0, 1000)}`, "api_error"));
+    // The proxy may have trimmed older turns to recover from a 413; keep looping
+    // on the compacted history.
+    messages = call.body.messages ?? messages;
+    compacted = compacted || call.compacted;
+    if (!call.resp.ok) {
+      return json(res, call.overflow ? 413 : call.resp.status === 401 || call.resp.status === 429 ? call.resp.status : 502,
+        openAIError(`free-pi backend ${call.resp.status}: ${(call.text ?? "").slice(0, 1000)}`, "api_error"));
     }
-    const completion = await resp.json();
+    const completion = await call.resp.json();
     recordUsage(completion.model ?? upstreamBody.model, completion.usage);
     const msg = completion.choices?.[0]?.message ?? {};
     const calls = msg.tool_calls ?? [];
@@ -625,7 +782,12 @@ async function runWithMcp(token, upstreamBody, wantsStream, res, turnId) {
   }
   if (!final) return json(res, 502, openAIError("MCP loop produced no completion", "api_error"));
   if (wantsStream) {
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      ...(compacted ? { "x-freepi-compacted": "1" } : {}),
+    });
     return res.end(completionToSSE(final));
   }
   return json(res, 200, final);
@@ -977,16 +1139,13 @@ async function handleChatCompletions(req, res) {
   }
 
   const sentVersion = getClientVersion();
-  let upstream;
+  let call;
   try {
-    upstream = await fetch(`${BASE}/v1/chat/completions`, {
-      method: "POST",
-      headers: upstreamHeaders(token, turnId),
-      body: JSON.stringify(upstreamBody),
-    });
+    call = await fetchUpstreamWithCompaction(token, upstreamBody, turnId);
   } catch (err) {
     return json(res, 502, openAIError(`Cannot reach free-pi backend: ${err.message}`, "api_error"));
   }
+  let upstream = call.resp;
 
   // Expired sign-in or outdated client version: refresh credentials and ask
   // the backend for its current minimum/latest version, then retry once.
@@ -996,40 +1155,47 @@ async function handleChatCompletions(req, res) {
     const fresh = loadToken();
     const freshVersion = getClientVersion();
     if (fresh && (fresh !== token || freshVersion !== sentVersion)) {
-      upstream = await fetch(`${BASE}/v1/chat/completions`, {
-        method: "POST",
-        headers: upstreamHeaders(fresh, turnId),
-        body: JSON.stringify(upstreamBody),
-      });
+      try {
+        call = await fetchUpstreamWithCompaction(fresh, call.body, turnId);
+      } catch (err) {
+        return json(res, 502, openAIError(`Cannot reach free-pi backend: ${err.message}`, "api_error"));
+      }
+      upstream = call.resp;
     }
   }
 
   if (!upstream.ok) {
-    const text = await upstream.text().catch(() => "");
+    const text = call.text ?? await upstream.text().catch(() => "");
     let detail = text.slice(0, 2000);
     try {
       const parsed = JSON.parse(text);
       detail = parsed?.error?.message ?? parsed?.detail ?? JSON.stringify(parsed).slice(0, 2000);
     } catch {}
+    const overflow = call.overflow === true || isContextOverflow(upstream.status, text);
     const hint =
-      upstream.status === 401
-        ? " (free-pi sign-in expired — run `npx free-pi-cli@latest` to sign in again)"
-        : upstream.status === 426
-          ? ` (proxy sent client version ${sentVersion} and could not self-heal; run \`npx free-pi-cli@latest\` once so the CLI records its new version, or set FREEPI_CLIENT_VERSION, or check connectivity to ${BASE})`
-          : upstream.status === 429
-            ? " (daily free-pi allowance spent — /usage in free-pi, or /buy-credits)"
-            : "";
-    return json(res, upstream.status === 401 || upstream.status === 429 ? upstream.status : 502,
-      openAIError(`free-pi backend ${upstream.status}: ${detail}${hint}`, "api_error"));
+      overflow
+        ? " (the proxy already dropped the oldest turns and the request still does not fit — start a new chat, or lower the attached files/context)"
+        : upstream.status === 401
+          ? " (free-pi sign-in expired — run `npx free-pi-cli@latest` to sign in again)"
+          : upstream.status === 426
+            ? ` (proxy sent client version ${sentVersion} and could not self-heal; run \`npx free-pi-cli@latest\` once so the CLI records its new version, or set FREEPI_CLIENT_VERSION, or check connectivity to ${BASE})`
+            : upstream.status === 429
+              ? " (daily free-pi allowance spent — /usage in free-pi, or /buy-credits)"
+              : "";
+    return json(res, overflow ? 413 : upstream.status === 401 || upstream.status === 429 ? upstream.status : 502,
+      openAIError(`free-pi backend ${upstream.status}: ${detail}${hint}`, overflow ? "context_too_long" : "api_error"));
   }
 
   if (!wantsStream) {
-    const data = await upstream.text();
+    const data = call.text ?? await upstream.text();
     try {
       const parsed = JSON.parse(data);
       recordUsage(parsed.model ?? upstreamBody.model, parsed.usage);
     } catch {}
-    res.writeHead(upstream.status, { "content-type": "application/json" });
+    res.writeHead(upstream.status, {
+      "content-type": "application/json",
+      ...(call.compacted ? { "x-freepi-compacted": "1" } : {}),
+    });
     return res.end(data);
   }
 
@@ -1039,6 +1205,7 @@ async function handleChatCompletions(req, res) {
     "content-type": upstream.headers.get("content-type") || "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive",
+    ...(call.compacted ? { "x-freepi-compacted": "1" } : {}),
   });
   const tap = makeSseScanner((ev) => {
     if (ev.usage) recordUsage(ev.model ?? upstreamBody.model, ev.usage);
@@ -1255,6 +1422,7 @@ server.listen(PORT, HOST, async () => {
   const glm = specs["glm-5.3-flash"];
   console.log(`  maxima       context=${glm?.contextWindow ?? CONTEXT_WINDOW} max_tokens=${glm?.maxOutput ?? MAX_OUTPUT_TOKENS} reasoning_effort=${REASONING_EFFORT}${FORCE_MAXIMA ? " (forced)" : ""} (${Object.keys(specs).length} model specs loaded${specsCache.at ? "" : " — fetching in background"})`);
   console.log(`  models       ${models.filter((m) => m.section !== "defense").map((m) => m.id).join(", ")}`);
+  console.log(`  overflow     drop oldest turns after a 413 (up to ${COMPACT_MAX_TRIES} retries, keep ${Math.round(COMPACT_KEEP_RATIO * 100)}%; overrides FREEPI_PROXY_COMPACT_*)`);
   if (MCP_MODE !== "off") {
     mcp.connectAll().then((n) => console.log(`  mcp          ${n} server(s) connected${n ? ": " + [...mcp.servers.keys()].join(", ") : " (no mcp.json found)"}`)).catch(() => {});
   } else {
