@@ -680,6 +680,222 @@ function largestMediaBytes(body) {
   return { bytes: worst, url: worstUrl };
 }
 
+
+// ---------- attachment downscaling ----------
+//
+// The backend rejects a request body over ~0.94 MB (see
+// REQUEST_BODY_LIMIT_BYTES), and base64 costs 4/3 of the file size, so inline
+// attachments must stay under roughly 700 KB. Rather than reject the user's
+// 1-4 MB screenshot, shrink it here: decode PNG in pure JS (node:zlib only, no
+// native dependency so the workflow needs no npm install), box-filter down to a
+// sane pixel budget, and re-encode as PNG. Images we cannot decode (JPEG/WebP)
+// fall back to the size-limit error.
+const DOWNSCALE_ENABLED = process.env.FREEPI_PROXY_DOWNSCALE !== "0";
+// Vision cost tracks px/763; ~1.15 MP keeps quality high while costing ~1500
+// tokens. Long side is capped separately so panoramas stay readable.
+const DOWNSCALE_MAX_PIXELS = Number(process.env.FREEPI_PROXY_MAX_IMAGE_PIXELS || 1150000);
+const DOWNSCALE_MAX_SIDE = Number(process.env.FREEPI_PROXY_MAX_IMAGE_SIDE || 1800);
+// Target base64 bytes for a single attachment (leaves room for the rest of the
+// body under the ~0.94 MB cap).
+const DOWNSCALE_TARGET_B64 = Number(process.env.FREEPI_PROXY_IMAGE_BYTES || 620000);
+
+const PNG_SIG = 0x89504e47;
+const CRC_TBL = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = CRC_TBL[(c ^ buf[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+  const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
+  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+  return Buffer.concat([len, td, crc]);
+}
+
+// Decode a non-interlaced 8-bit PNG (grey/RGB/RGBA) to raw pixels.
+function decodePng(buf) {
+  if (buf.length < 8 || buf.readUInt32BE(0) !== PNG_SIG) return null;
+  let i = 8, w = 0, h = 0, depth = 0, ct = 0, inter = 0;
+  const idat = [];
+  while (i + 8 <= buf.length) {
+    const len = buf.readUInt32BE(i);
+    const type = buf.toString("ascii", i + 4, i + 8);
+    const data = buf.subarray(i + 8, i + 8 + len);
+    if (type === "IHDR") {
+      w = data.readUInt32BE(0); h = data.readUInt32BE(4);
+      depth = data[8]; ct = data[9]; inter = data[12];
+    } else if (type === "IDAT") idat.push(data);
+    else if (type === "IEND") break;
+    i += 12 + len;
+  }
+  if (!w || !h || depth !== 8 || inter) return null;
+  const chan = ct === 2 ? 3 : ct === 6 ? 4 : ct === 0 ? 1 : null;
+  if (!chan) return null;
+  let raw;
+  try { raw = zlib.inflateSync(Buffer.concat(idat)); } catch { return null; }
+  const stride = w * chan;
+  if (raw.length < (stride + 1) * h) return null;
+  const out = Buffer.alloc(h * stride);
+  let pos = 0;
+  for (let y = 0; y < h; y++) {
+    const ft = raw[pos++];
+    const line = raw.subarray(pos, pos + stride); pos += stride;
+    const start = y * stride;
+    for (let x = 0; x < stride; x++) {
+      const a = x >= chan ? out[start + x - chan] : 0;
+      const b = y > 0 ? out[start - stride + x] : 0;
+      const c = (y > 0 && x >= chan) ? out[start - stride + x - chan] : 0;
+      let v = line[x];
+      if (ft === 1) v += a;
+      else if (ft === 2) v += b;
+      else if (ft === 3) v += (a + b) >> 1;
+      else if (ft === 4) {
+        const p = a + b - c;
+        const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+        v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+      }
+      out[start + x] = v & 255;
+    }
+  }
+  return { w, h, chan, data: out };
+}
+
+// Box-filter resize to (nw, nh); averaging avoids the aliasing that makes
+// downscaled screenshots unreadable to a vision model.
+function resizeBox(img, nw, nh) {
+  const { w, h, chan, data } = img;
+  const out = Buffer.alloc(nw * nh * 3);
+  const xr = w / nw, yr = h / nh;
+  for (let y = 0; y < nh; y++) {
+    const y0 = Math.floor(y * yr), y1 = Math.max(y0 + 1, Math.floor((y + 1) * yr));
+    for (let x = 0; x < nw; x++) {
+      const x0 = Math.floor(x * xr), x1 = Math.max(x0 + 1, Math.floor((x + 1) * xr));
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let sy = y0; sy < y1 && sy < h; sy++) {
+        const row = sy * w * chan;
+        for (let sx = x0; sx < x1 && sx < w; sx++) {
+          const o = row + sx * chan;
+          if (chan === 1) { const v = data[o]; r += v; g += v; b += v; }
+          else { r += data[o]; g += data[o + 1]; b += data[o + 2]; }
+          n++;
+        }
+      }
+      const q = (y * nw + x) * 3;
+      out[q] = (r / n) | 0; out[q + 1] = (g / n) | 0; out[q + 2] = (b / n) | 0;
+    }
+  }
+  return out;
+}
+
+function encodePng(rgb, w, h) {
+  const stride = w * 3;
+  const raw = Buffer.alloc((stride + 1) * h);
+  for (let y = 0; y < h; y++) {
+    raw[y * (stride + 1)] = 0; // filter: none
+    rgb.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
+  return Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw, { level: 9 })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// Shrink one data URL if it is over the size limit or the pixel budget.
+// Returns { url, changed, beforeB64, afterB64, beforePx, afterPx } or null when
+// the image cannot be handled (non-PNG, or still too big after resizing).
+function downscaleDataUrl(url) {
+  if (!DOWNSCALE_ENABLED) return null;
+  if (typeof url !== "string" || !url.startsWith("data:")) return null;
+  const comma = url.indexOf(",");
+  if (comma < 0) return null;
+  const meta = url.slice(5, comma);
+  if (!/;base64/i.test(meta)) return null;
+  const b64 = url.slice(comma + 1);
+  let buf;
+  try { buf = Buffer.from(b64, "base64"); } catch { return null; }
+  const img = decodePng(buf);
+  if (!img) return null; // JPEG/WebP/etc: cannot shrink without a codec
+
+  const px = img.w * img.h;
+  const longSide = Math.max(img.w, img.h);
+  const overBytes = b64.length > DOWNSCALE_TARGET_B64;
+  const overPixels = px > DOWNSCALE_MAX_PIXELS || longSide > DOWNSCALE_MAX_SIDE;
+  if (!overBytes && !overPixels) return null; // already fine, don't touch it
+
+  let scale = Math.min(1, Math.sqrt(DOWNSCALE_MAX_PIXELS / px));
+  if (longSide * scale > DOWNSCALE_MAX_SIDE) scale = DOWNSCALE_MAX_SIDE / longSide;
+
+  // Shrink until the encoded payload fits; each step also drops pixels.
+  let nw = Math.max(1, Math.round(img.w * scale));
+  let nh = Math.max(1, Math.round(img.h * scale));
+  let outBuf = null, outB64 = "";
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const rgb = resizeBox(img, nw, nh);
+    outBuf = encodePng(rgb, nw, nh);
+    outB64 = outBuf.toString("base64");
+    if (outB64.length <= DOWNSCALE_TARGET_B64) break;
+    if (nw <= 32 || nh <= 32) break;
+    const f = Math.sqrt(DOWNSCALE_TARGET_B64 / outB64.length) * 0.92;
+    nw = Math.max(1, Math.round(nw * Math.min(f, 0.9)));
+    nh = Math.max(1, Math.round(nh * Math.min(f, 0.9)));
+  }
+  if (!outB64 || outB64.length >= b64.length) return null; // no gain
+
+  return {
+    url: `data:image/png;base64,${outB64}`,
+    changed: true,
+    beforeB64: b64.length,
+    afterB64: outB64.length,
+    beforePx: px,
+    afterPx: nw * nh,
+  };
+}
+
+// Walk the body and downscale every inline image that is over budget.
+function downscaleBodyImages(body) {
+  const report = [];
+  const walk = (v) => {
+    if (v == null) return;
+    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+    if (typeof v !== "object") return;
+    const t = v.type;
+    if (t === "image_url" || t === "image" || t === "input_image") {
+      const raw = v.image_url ?? v.source ?? v;
+      const isStr = typeof raw === "string";
+      const cur = isStr ? raw : (typeof raw?.url === "string" ? raw.url : "");
+      const inline = typeof raw?.data === "string" ? `data:${raw.media_type || "image/png"};base64,${raw.data}` : "";
+      const r = downscaleDataUrl(cur || inline);
+      if (r) {
+        if (isStr) v.image_url = r.url;
+        else if (typeof v.image_url === "object" && v.image_url) v.image_url.url = r.url;
+        // Anthropic-style: keep the part shape, replace the payload.
+        else if (v.source && typeof v.source === "object") {
+          v.source = { ...v.source, type: "base64", media_type: "image/png", data: r.url.split(",")[1] };
+        }
+        report.push(r);
+      }
+      return;
+    }
+    for (const x of Object.values(v)) walk(x);
+  };
+  walk(body?.messages);
+  return report;
+}
+
 function estimateTokens(value) {
   if (value == null) return 0;
   if (typeof value === "string") return Math.ceil(value.length / 4);
@@ -1238,6 +1454,19 @@ async function handleChatCompletions(req, res) {
   // ad (>=60s refresh), impression reported, same turn id on the chat call.
   const turnId = crypto.randomUUID();
 
+  // Oversized screenshots (1-4 MB is normal) would exceed the backend's body
+  // cap. Shrink them here instead of failing the user's request.
+  const shrunk = downscaleBodyImages(upstreamBody);
+  if (shrunk.length) {
+    const saved = shrunk.reduce((n, r) => n + (r.beforeB64 - r.afterB64), 0);
+    console.log(
+      `[downscale] ${shrunk.length} image(s): ` +
+      shrunk.map((r) => `${r.beforePx}px/${(r.beforeB64 / 1048576).toFixed(2)}MB -> ` +
+        `${r.afterPx}px/${(r.afterB64 / 1048576).toFixed(2)}MB`).join(", ") +
+      ` (saved ${(saved / 1048576).toFixed(2)} MB of base64)`
+    );
+  }
+
   // Fail fast on an attachment the backend will reject regardless of history:
   // its own 413 says "conversation is too long", which sends users chasing the
   // wrong fix. The cap is the request body size (~0.94 MB measured).
@@ -1246,11 +1475,14 @@ async function handleChatCompletions(req, res) {
   if (bodyBytes > REQUEST_BODY_LIMIT_BYTES) {
     const overBy = ((bodyBytes - REQUEST_BODY_LIMIT_BYTES) / 1024).toFixed(0);
     const mediaMb = (media.bytes / 1048576).toFixed(2);
+    const tried = shrunk.length
+      ? ` The proxy already downscaled ${shrunk.length} image(s) and the body is still over.`
+      : ` The proxy could not downscale this attachment: it can only shrink PNGs.`;
     return json(res, 413, openAIError(
       `Request body is ${(bodyBytes / 1048576).toFixed(2)} MB, over the backend's ~${(REQUEST_BODY_LIMIT_BYTES / 1048576).toFixed(2)} MB limit ` +
-      `(${overBy} KB too large). Largest attachment: ${mediaMb} MB of base64. ` +
-      `This is a payload-size cap, not a context-length problem — dropping history cannot help. ` +
-      `Downscale or re-compress the image (JPEG/WebP, or resize to <=1568px on the long side).`,
+      `(${overBy} KB too large). Largest attachment: ${mediaMb} MB of base64.` + tried +
+      ` This is a payload-size cap, not a context-length problem — dropping history cannot help. ` +
+      `Convert the image to PNG (auto-downscaled), or re-encode it as JPEG/WebP and resize to <=1568px.`,
       "context_too_long"));
   }
 
