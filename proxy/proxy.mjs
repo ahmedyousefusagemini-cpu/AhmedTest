@@ -632,6 +632,14 @@ function imagePixelCount(buf) {
   return 0;
 }
 
+// The backend rejects a request body of roughly 0.94 MB and up with the
+// misleading "This conversation is too long" 413 -- measured: a 200x200 image
+// (79 prompt tokens) succeeded at a 0.951 MB body and failed at 0.959 MB, while
+// identical pixels reached 413 once the base64 padding crossed ~1 MB. So the cap
+// is BYTE SIZE of the request, not pixels and not tokens. Compaction can never
+// fix this (the attachment survives every trim), so detect it up front.
+const REQUEST_BODY_LIMIT_BYTES = 940_000;
+
 function mediaTokens(url) {
   if (typeof url !== "string" || !url) return MEDIA_UNKNOWN_TOKENS;
   if (!url.startsWith("data:")) {
@@ -648,6 +656,28 @@ function mediaTokens(url) {
   }
   if (!px) return MEDIA_UNKNOWN_TOKENS;
   return Math.ceil(px * MEDIA_TOKENS_PER_PIXEL) + MEDIA_FIXED_TOKENS;
+}
+
+// Largest inline attachment in a body, in bytes of base64 payload.
+function largestMediaBytes(body) {
+  let worst = 0, worstUrl = "";
+  const walk = (v) => {
+    if (v == null) return;
+    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+    if (typeof v !== "object") return;
+    const t = v.type;
+    if (t === "image_url" || t === "image" || t === "input_image" || t === "video_url") {
+      const raw = v.image_url ?? v.source ?? v;
+      const url = typeof raw === "string" ? raw : (typeof raw?.url === "string" ? raw.url : "");
+      const data = typeof raw?.data === "string" ? raw.data : "";
+      const len = Math.max(url.length, data.length);
+      if (len > worst) { worst = len; worstUrl = url || "(inline base64)"; }
+      return;
+    }
+    for (const x of Object.values(v)) walk(x);
+  };
+  walk(body?.messages);
+  return { bytes: worst, url: worstUrl };
 }
 
 function estimateTokens(value) {
@@ -1207,6 +1237,23 @@ async function handleChatCompletions(req, res) {
   // One ad cycle per user message, exactly like the CLI: new turn id, banner
   // ad (>=60s refresh), impression reported, same turn id on the chat call.
   const turnId = crypto.randomUUID();
+
+  // Fail fast on an attachment the backend will reject regardless of history:
+  // its own 413 says "conversation is too long", which sends users chasing the
+  // wrong fix. The cap is the request body size (~0.94 MB measured).
+  const media = largestMediaBytes(upstreamBody);
+  const bodyBytes = Buffer.byteLength(JSON.stringify(upstreamBody));
+  if (bodyBytes > REQUEST_BODY_LIMIT_BYTES) {
+    const overBy = ((bodyBytes - REQUEST_BODY_LIMIT_BYTES) / 1024).toFixed(0);
+    const mediaMb = (media.bytes / 1048576).toFixed(2);
+    return json(res, 413, openAIError(
+      `Request body is ${(bodyBytes / 1048576).toFixed(2)} MB, over the backend's ~${(REQUEST_BODY_LIMIT_BYTES / 1048576).toFixed(2)} MB limit ` +
+      `(${overBy} KB too large). Largest attachment: ${mediaMb} MB of base64. ` +
+      `This is a payload-size cap, not a context-length problem — dropping history cannot help. ` +
+      `Downscale or re-compress the image (JPEG/WebP, or resize to <=1568px on the long side).`,
+      "context_too_long"));
+  }
+
   await maybeShowAd(turnId);
 
   // MCP servers connected? Inject their tools and run the server-side loop.
