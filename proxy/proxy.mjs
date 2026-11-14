@@ -703,8 +703,16 @@ const DOWNSCALE_MAX_SIDE = Number(process.env.FREEPI_PROXY_MAX_IMAGE_SIDE || 180
 // Target base64 characters for a single attachment (leaves room for the rest of
 // the body under the 1,000,000-character cap).
 const DOWNSCALE_TARGET_B64 = Number(process.env.FREEPI_PROXY_IMAGE_BYTES || 620000);
+// Quality used when re-encoding a JPEG attachment. 85 is visually near-lossless
+// for screenshots and photos while keeping the payload small.
+const DOWNSCALE_JPEG_QUALITY = Number(process.env.FREEPI_PROXY_JPEG_QUALITY || 85);
 
 const PNG_SIG = 0x89504e47;
+
+// SOI marker. Covers every JPEG variant we can decode (JFIF, EXIF, progressive).
+function isJpeg(buf) {
+  return buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+}
 const CRC_TBL = (() => {
   const t = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -742,23 +750,29 @@ function decodePng(buf) {
     else if (type === "IEND") break;
     i += 12 + len;
   }
-  if (!w || !h || depth !== 8 || inter) return null;
-  const chan = ct === 2 ? 3 : ct === 6 ? 4 : ct === 0 ? 1 : null;
+  // Only 8- and 16-bit, non-interlaced images are supported. Palette (ct 3)
+  // images are rare for screenshots and are left to the caller.
+  if (!w || !h || inter) return null;
+  if (depth !== 8 && depth !== 16) return null;
+  const chan = ct === 2 ? 3 : ct === 6 ? 4 : ct === 0 ? 1 : ct === 4 ? 2 : null;
   if (!chan) return null;
   let raw;
   try { raw = zlib.inflateSync(Buffer.concat(idat)); } catch { return null; }
-  const stride = w * chan;
+  // Filtering operates on bytes, so for 16-bit images the stride is in bytes and
+  // each sample is two bytes (high byte first).
+  const bps = depth === 16 ? 2 : 1;
+  const stride = w * chan * bps;
   if (raw.length < (stride + 1) * h) return null;
-  const out = Buffer.alloc(h * stride);
+  const filt = Buffer.alloc(h * stride);
   let pos = 0;
   for (let y = 0; y < h; y++) {
     const ft = raw[pos++];
     const line = raw.subarray(pos, pos + stride); pos += stride;
     const start = y * stride;
     for (let x = 0; x < stride; x++) {
-      const a = x >= chan ? out[start + x - chan] : 0;
-      const b = y > 0 ? out[start - stride + x] : 0;
-      const c = (y > 0 && x >= chan) ? out[start - stride + x - chan] : 0;
+      const a = x >= bps ? filt[start + x - bps] : 0;
+      const b = y > 0 ? filt[start - stride + x] : 0;
+      const c = (y > 0 && x >= bps) ? filt[start - stride + x - bps] : 0;
       let v = line[x];
       if (ft === 1) v += a;
       else if (ft === 2) v += b;
@@ -768,9 +782,13 @@ function decodePng(buf) {
         const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
         v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
       }
-      out[start + x] = v & 255;
+      filt[start + x] = v & 255;
     }
   }
+  if (depth === 8) return { w, h, chan, data: filt };
+  // 16-bit: keep the high byte of each big-endian sample.
+  const out = Buffer.alloc(w * h * chan);
+  for (let i = 0, j = 0; i < filt.length; i += 2, j++) out[j] = filt[i];
   return { w, h, chan, data: out };
 }
 
@@ -819,6 +837,63 @@ function encodePng(rgb, w, h) {
   ]);
 }
 
+// ---------------------------------------------------------------------------
+// JPEG support for downscaling.
+//
+// Baseline JPEGs are decoded by decodeJpeg() below. Progressive and other exotic
+// JPEGs use the fuller decoder vendored from jpeg-js, because the deploy workflow
+// cannot install npm packages.
+//
+// Copyright 2011 notmasteryet. Licensed under the Apache License, Version 2.0:
+//   http://www.apache.org/licenses/LICENSE-2.0
+// Distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
+//
+// Upstream code, minified and otherwise unmodified.
+// ---------------------------------------------------------------------------
+var JpegImage=function(){"use strict";var e=new Int32Array([0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,35,42,49,56,57,50,43,36,29,22,15,23,30,37,44,51,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63]),r=4017,n=799,o=3406,a=2276,t=1567,s=3784,i=5793,c=2896;function f(){}function l(e,r){for(var n,o,a=0,t=[],s=16;s>0&&!e[s-1];)s--;t.push({children:[],index:0});var i,c=t[0];for(n=0;n<s;n++){for(o=0;o<e[n];o++){for((c=t.pop()).children[c.index]=r[a];c.index>0;){if(0===t.length)throw new Error("Could not recreate Huffman Table");c=t.pop()}for(c.index++,t.push(c);t.length<=n;)t.push(i={children:[],index:0}),c.children[c.index]=i.children,c=i;a++}n+1<s&&(t.push(i={children:[],index:0}),c.children[c.index]=i.children,c=i)}return t[0].children}function h(r,n,o,a,t,s,i,c,f,l){o.precision,o.samplesPerLine,o.scanLines;var h=o.mcusPerLine,u=o.progressive,m=(o.maxH,o.maxV,n),d=0,p=0;function v(){if(p>0)return p--,d>>p&1;if(255==(d=r[n++])){var e=r[n++];if(e)throw new Error("unexpected marker: "+(d<<8|e).toString(16))}return p=7,d>>>7}function w(e){for(var r,n=e;null!==(r=v());){if("number"==typeof(n=n[r]))return n;if("object"!=typeof n)throw new Error("invalid huffman sequence")}return null}function b(e){for(var r=0;e>0;){var n=v();if(null===n)return;r=r<<1|n,e--}return r}function g(e){var r=b(e);return r>=1<<e-1?r:r+(-1<<e)+1}var y=0;var k,x=0;function A(e,r,n,o,a){var t=n%h,s=(n/h|0)*e.v+o,i=t*e.h+a;void 0===e.blocks[s]&&l.tolerantDecoding||r(e,e.blocks[s][i])}function P(e,r,n){var o=n/e.blocksPerLine|0,a=n%e.blocksPerLine;void 0===e.blocks[o]&&l.tolerantDecoding||r(e,e.blocks[o][a])}var M,E,T,C,I,L,X=a.length;L=u?0===s?0===c?function(e,r){var n=w(e.huffmanTableDC),o=0===n?0:g(n)<<f;r[0]=e.pred+=o}:function(e,r){r[0]|=v()<<f}:0===c?function(r,n){if(y>0)y--;else for(var o=s,a=i;o<=a;){var t=w(r.huffmanTableAC),c=15&t,l=t>>4;if(0!==c)n[e[o+=l]]=g(c)*(1<<f),o++;else{if(l<15){y=b(l)+(1<<l)-1;break}o+=16}}}:function(r,n){for(var o=s,a=i,t=0;o<=a;){var c=e[o],l=n[c]<0?-1:1;switch(x){case 0:var h=w(r.huffmanTableAC),u=15&h;if(t=h>>4,0===u)t<15?(y=b(t)+(1<<t),x=4):(t=16,x=1);else{if(1!==u)throw new Error("invalid ACn encoding");k=g(u),x=t?2:3}continue;case 1:case 2:n[c]?n[c]+=(v()<<f)*l:0===--t&&(x=2==x?3:0);break;case 3:n[c]?n[c]+=(v()<<f)*l:(n[c]=k<<f,x=0);break;case 4:n[c]&&(n[c]+=(v()<<f)*l)}o++}4===x&&0===--y&&(x=0)}:function(r,n){var o=w(r.huffmanTableDC),a=0===o?0:g(o);n[0]=r.pred+=a;for(var t=1;t<64;){var s=w(r.huffmanTableAC),i=15&s,c=s>>4;if(0!==i)n[e[t+=c]]=g(i),t++;else{if(c<15)break;t+=16}}};var U,B,D,R,Y=0;for(B=1==X?a[0].blocksPerLine*a[0].blocksPerColumn:h*o.mcusPerColumn,t||(t=B);Y<B;){for(E=0;E<X;E++)a[E].pred=0;if(y=0,1==X)for(M=a[0],I=0;I<t;I++)P(M,L,Y),Y++;else for(I=0;I<t;I++){for(E=0;E<X;E++)for(D=(M=a[E]).h,R=M.v,T=0;T<R;T++)for(C=0;C<D;C++)A(M,L,Y,T,C);if(++Y===B)break}if(Y===B)do{if(255===r[n]&&0!==r[n+1])break;n+=1}while(n<r.length-2);if(p=0,(U=r[n]<<8|r[n+1])<65280)throw new Error("marker was not found");if(!(U>=65488&&U<=65495))break;n+=2}return n-m}function u(e,f){var l,h,u=[],m=f.blocksPerLine,d=f.blocksPerColumn,p=m<<3,w=new Int32Array(64),b=new Uint8Array(64);function g(e,l,h){var u,m,d,p,v,w,b,g,y,k,x=f.quantizationTable,A=h;for(k=0;k<64;k++)A[k]=e[k]*x[k];for(k=0;k<8;++k){var P=8*k;0!=A[1+P]||0!=A[2+P]||0!=A[3+P]||0!=A[4+P]||0!=A[5+P]||0!=A[6+P]||0!=A[7+P]?(u=i*A[0+P]+128>>8,m=i*A[4+P]+128>>8,d=A[2+P],p=A[6+P],v=c*(A[1+P]-A[7+P])+128>>8,g=c*(A[1+P]+A[7+P])+128>>8,w=A[3+P]<<4,b=A[5+P]<<4,y=u-m+1>>1,u=u+m+1>>1,m=y,y=d*s+p*t+128>>8,d=d*t-p*s+128>>8,p=y,y=v-b+1>>1,v=v+b+1>>1,b=y,y=g+w+1>>1,w=g-w+1>>1,g=y,y=u-p+1>>1,u=u+p+1>>1,p=y,y=m-d+1>>1,m=m+d+1>>1,d=y,y=v*a+g*o+2048>>12,v=v*o-g*a+2048>>12,g=y,y=w*n+b*r+2048>>12,w=w*r-b*n+2048>>12,b=y,A[0+P]=u+g,A[7+P]=u-g,A[1+P]=m+b,A[6+P]=m-b,A[2+P]=d+w,A[5+P]=d-w,A[3+P]=p+v,A[4+P]=p-v):(y=i*A[0+P]+512>>10,A[0+P]=y,A[1+P]=y,A[2+P]=y,A[3+P]=y,A[4+P]=y,A[5+P]=y,A[6+P]=y,A[7+P]=y)}for(k=0;k<8;++k){var M=k;0!=A[8+M]||0!=A[16+M]||0!=A[24+M]||0!=A[32+M]||0!=A[40+M]||0!=A[48+M]||0!=A[56+M]?(u=i*A[0+M]+2048>>12,m=i*A[32+M]+2048>>12,d=A[16+M],p=A[48+M],v=c*(A[8+M]-A[56+M])+2048>>12,g=c*(A[8+M]+A[56+M])+2048>>12,w=A[24+M],b=A[40+M],y=u-m+1>>1,u=u+m+1>>1,m=y,y=d*s+p*t+2048>>12,d=d*t-p*s+2048>>12,p=y,y=v-b+1>>1,v=v+b+1>>1,b=y,y=g+w+1>>1,w=g-w+1>>1,g=y,y=u-p+1>>1,u=u+p+1>>1,p=y,y=m-d+1>>1,m=m+d+1>>1,d=y,y=v*a+g*o+2048>>12,v=v*o-g*a+2048>>12,g=y,y=w*n+b*r+2048>>12,w=w*r-b*n+2048>>12,b=y,A[0+M]=u+g,A[56+M]=u-g,A[8+M]=m+b,A[48+M]=m-b,A[16+M]=d+w,A[40+M]=d-w,A[24+M]=p+v,A[32+M]=p-v):(y=i*h[k+0]+8192>>14,A[0+M]=y,A[8+M]=y,A[16+M]=y,A[24+M]=y,A[32+M]=y,A[40+M]=y,A[48+M]=y,A[56+M]=y)}for(k=0;k<64;++k){var E=128+(A[k]+8>>4);l[k]=E<0?0:E>255?255:E}}v(p*d*8);for(var y=0;y<d;y++){var k=y<<3;for(l=0;l<8;l++)u.push(new Uint8Array(p));for(var x=0;x<m;x++){g(f.blocks[y][x],b,w);var A=0,P=x<<3;for(h=0;h<8;h++){var M=u[k+h];for(l=0;l<8;l++)M[P+l]=b[A++]}}}return u}function m(e){return e<0?0:e>255?255:e}f.prototype={load:function(e){var r=new XMLHttpRequest;r.open("GET",e,!0),r.responseType="arraybuffer",r.onload=function(){var e=new Uint8Array(r.response||r.mozResponseArrayBuffer);this.parse(e),this.onload&&this.onload()}.bind(this),r.send(null)},parse:function(r){var n=1e3*this.opts.maxResolutionInMP*1e3,o=0;r.length;function a(){var e=r[o]<<8|r[o+1];return o+=2,e}function t(){var e=a(),n=r.subarray(o,o+e-2);return o+=n.length,n}function s(e){var r,n,o=1,a=1;for(n in e.components)e.components.hasOwnProperty(n)&&(o<(r=e.components[n]).h&&(o=r.h),a<r.v&&(a=r.v));var t=Math.ceil(e.samplesPerLine/8/o),s=Math.ceil(e.scanLines/8/a);for(n in e.components)if(e.components.hasOwnProperty(n)){r=e.components[n];var i=Math.ceil(Math.ceil(e.samplesPerLine/8)*r.h/o),c=Math.ceil(Math.ceil(e.scanLines/8)*r.v/a),f=t*r.h,l=s*r.v,h=[];v(256*(l*f));for(var u=0;u<l;u++){for(var m=[],d=0;d<f;d++)m.push(new Int32Array(64));h.push(m)}r.blocksPerLine=i,r.blocksPerColumn=c,r.blocks=h}e.maxH=o,e.maxV=a,e.mcusPerLine=t,e.mcusPerColumn=s}var i,c,f=null,m=null,d=[],p=[],w=[],b=[],g=a(),y=-1;if(this.comments=[],65496!=g)throw new Error("SOI not found");for(g=a();65497!=g;){switch(g){case 65280:break;case 65504:case 65505:case 65506:case 65507:case 65508:case 65509:case 65510:case 65511:case 65512:case 65513:case 65514:case 65515:case 65516:case 65517:case 65518:case 65519:case 65534:var k=t();if(65534===g){var x=String.fromCharCode.apply(null,k);this.comments.push(x)}65504===g&&74===k[0]&&70===k[1]&&73===k[2]&&70===k[3]&&0===k[4]&&(f={version:{major:k[5],minor:k[6]},densityUnits:k[7],xDensity:k[8]<<8|k[9],yDensity:k[10]<<8|k[11],thumbWidth:k[12],thumbHeight:k[13],thumbData:k.subarray(14,14+3*k[12]*k[13])}),65505===g&&69===k[0]&&120===k[1]&&105===k[2]&&102===k[3]&&0===k[4]&&(this.exifBuffer=k.subarray(5,k.length)),65518===g&&65===k[0]&&100===k[1]&&111===k[2]&&98===k[3]&&101===k[4]&&0===k[5]&&(m={version:k[6],flags0:k[7]<<8|k[8],flags1:k[9]<<8|k[10],transformCode:k[11]});break;case 65499:for(var A=a()+o-2;o<A;){var P=r[o++];v(256);var M=new Int32Array(64);if(P>>4){if(P>>4!=1)throw new Error("DQT: invalid table spec");for(Q=0;Q<64;Q++){M[e[Q]]=a()}}else for(Q=0;Q<64;Q++){M[e[Q]]=r[o++]}d[15&P]=M}break;case 65472:case 65473:case 65474:a(),(i={}).extended=65473===g,i.progressive=65474===g,i.precision=r[o++],i.scanLines=a(),i.samplesPerLine=a(),i.components={},i.componentsOrder=[];var E=i.scanLines*i.samplesPerLine;if(E>n){var T=Math.ceil((E-n)/1e6);throw new Error(`maxResolutionInMP limit exceeded by ${T}MP`)}var C,I=r[o++];for($=0;$<I;$++){C=r[o];var L=r[o+1]>>4,X=15&r[o+1],U=r[o+2];if(L<=0||X<=0)throw new Error("Invalid sampling factor, expected values above 0");i.componentsOrder.push(C),i.components[C]={h:L,v:X,quantizationIdx:U},o+=3}s(i),p.push(i);break;case 65476:var B=a();for($=2;$<B;){var D=r[o++],R=new Uint8Array(16),Y=0;for(Q=0;Q<16;Q++,o++)Y+=R[Q]=r[o];v(16+Y);var q=new Uint8Array(Y);for(Q=0;Q<Y;Q++,o++)q[Q]=r[o];$+=17+Y,(D>>4?w:b)[15&D]=l(R,q)}break;case 65501:a(),c=a();break;case 65500:a(),a();break;case 65498:a();var j=r[o++],G=[];for($=0;$<j;$++){W=i.components[r[o++]];var J=r[o++];W.huffmanTableDC=b[J>>4],W.huffmanTableAC=w[15&J],G.push(W)}var O=r[o++],S=r[o++],z=r[o++],H=h(r,o,i,G,c,O,S,z>>4,15&z,this.opts);o+=H;break;case 65535:255!==r[o]&&o--;break;default:if(255==r[o-3]&&r[o-2]>=192&&r[o-2]<=254){o-=3;break}if(224===g||225==g){if(-1!==y)throw new Error(`first unknown JPEG marker at offset ${y.toString(16)}, second unknown JPEG marker ${g.toString(16)} at offset ${(o-1).toString(16)}`);y=o-1;const e=a();if(255===r[o+e-2]){o+=e-2;break}}throw new Error("unknown JPEG marker "+g.toString(16))}g=a()}if(1!=p.length)throw new Error("only single frame JPEGs supported");for(var $=0;$<p.length;$++){var V=p[$].components;for(var Q in V)V[Q].quantizationTable=d[V[Q].quantizationIdx],delete V[Q].quantizationIdx}this.width=i.samplesPerLine,this.height=i.scanLines,this.jfif=f,this.adobe=m,this.components=[];for($=0;$<i.componentsOrder.length;$++){var W=i.components[i.componentsOrder[$]];this.components.push({lines:u(0,W),scaleX:W.h/i.maxH,scaleY:W.v/i.maxV})}},getData:function(e,r){var n,o,a,t,s,i,c,f,l,h,u,d,p,w,b,g,y,k,x,A,P,M=this.width/e,E=this.height/r,T=0,C=e*r*this.components.length;v(C);var I=new Uint8Array(C);switch(this.components.length){case 1:for(n=this.components[0],h=0;h<r;h++)for(s=n.lines[0|h*n.scaleY*E],l=0;l<e;l++)u=s[0|l*n.scaleX*M],I[T++]=u;break;case 2:for(n=this.components[0],o=this.components[1],h=0;h<r;h++)for(s=n.lines[0|h*n.scaleY*E],i=o.lines[0|h*o.scaleY*E],l=0;l<e;l++)u=s[0|l*n.scaleX*M],I[T++]=u,u=i[0|l*o.scaleX*M],I[T++]=u;break;case 3:for(P=!0,this.adobe&&this.adobe.transformCode?P=!0:void 0!==this.opts.colorTransform&&(P=!!this.opts.colorTransform),n=this.components[0],o=this.components[1],a=this.components[2],h=0;h<r;h++)for(s=n.lines[0|h*n.scaleY*E],i=o.lines[0|h*o.scaleY*E],c=a.lines[0|h*a.scaleY*E],l=0;l<e;l++)P?(u=s[0|l*n.scaleX*M],d=i[0|l*o.scaleX*M],k=m(u+1.402*((p=c[0|l*a.scaleX*M])-128)),x=m(u-.3441363*(d-128)-.71413636*(p-128)),A=m(u+1.772*(d-128))):(k=s[0|l*n.scaleX*M],x=i[0|l*o.scaleX*M],A=c[0|l*a.scaleX*M]),I[T++]=k,I[T++]=x,I[T++]=A;break;case 4:if(!this.adobe)throw new Error("Unsupported color mode (4 components)");for(P=!1,this.adobe&&this.adobe.transformCode?P=!0:void 0!==this.opts.colorTransform&&(P=!!this.opts.colorTransform),n=this.components[0],o=this.components[1],a=this.components[2],t=this.components[3],h=0;h<r;h++)for(s=n.lines[0|h*n.scaleY*E],i=o.lines[0|h*o.scaleY*E],c=a.lines[0|h*a.scaleY*E],f=t.lines[0|h*t.scaleY*E],l=0;l<e;l++)P?(u=s[0|l*n.scaleX*M],d=i[0|l*o.scaleX*M],p=c[0|l*a.scaleX*M],w=f[0|l*t.scaleX*M],b=255-m(u+1.402*(p-128)),g=255-m(u-.3441363*(d-128)-.71413636*(p-128)),y=255-m(u+1.772*(d-128))):(b=s[0|l*n.scaleX*M],g=i[0|l*o.scaleX*M],y=c[0|l*a.scaleX*M],w=f[0|l*t.scaleX*M]),I[T++]=255-b,I[T++]=255-g,I[T++]=255-y,I[T++]=255-w;break;default:throw new Error("Unsupported color mode")}return I},copyToImageData:function(e,r){var n,o,a,t,s,i,c,f,l,h=e.width,u=e.height,d=e.data,p=this.getData(h,u),v=0,w=0;switch(this.components.length){case 1:for(o=0;o<u;o++)for(n=0;n<h;n++)a=p[v++],d[w++]=a,d[w++]=a,d[w++]=a,r&&(d[w++]=255);break;case 3:for(o=0;o<u;o++)for(n=0;n<h;n++)c=p[v++],f=p[v++],l=p[v++],d[w++]=c,d[w++]=f,d[w++]=l,r&&(d[w++]=255);break;case 4:for(o=0;o<u;o++)for(n=0;n<h;n++)s=p[v++],i=p[v++],a=p[v++],c=255-m(s*(1-(t=p[v++])/255)+t),f=255-m(i*(1-t/255)+t),l=255-m(a*(1-t/255)+t),d[w++]=c,d[w++]=f,d[w++]=l,r&&(d[w++]=255);break;default:throw new Error("Unsupported color mode")}}};var d=0,p=0;function v(e=0){var r=d+e;if(r>p){var n=Math.ceil((r-p)/1024/1024);throw new Error(`maxMemoryUsageInMB limit exceeded by at least ${n}MB`)}d=r}return f.resetMaxMemoryUsage=function(e){d=0,p=e},f.getBytesAllocated=function(){return d},f.requestMemoryAllocation=v,f}();
+
+// Decode any JPEG (baseline or progressive) into { w, h, chan: 3, data: RGB }.
+function decodeJpegFull(buf) {
+  try {
+    JpegImage.resetMaxMemoryUsage(768 * 1024 * 1024);
+    const img = new JpegImage();
+    img.opts = { maxResolutionInMP: 120, maxMemoryUsageInMB: 768, tolerantDecoding: true };
+    img.parse(buf);
+    if (!img.width || !img.height) return null;
+    if (img.width * img.height > 64e6) return null; // refuse absurd dimensions
+    const rgba = new Uint8Array(img.width * img.height * 4);
+    img.copyToImageData({ data: rgba, width: img.width, height: img.height }, true);
+    const rgb = Buffer.allocUnsafe(img.width * img.height * 3);
+    for (let i = 0, j = 0; i < rgba.length; i += 4, j += 3) {
+      rgb[j] = rgba[i];
+      rgb[j + 1] = rgba[i + 1];
+      rgb[j + 2] = rgba[i + 2];
+    }
+    return { w: img.width, h: img.height, chan: 3, data: rgb };
+  } catch (err) {
+    log("downscale", "jpeg decode failed:", err && err.message);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// JPEG encoder, also vendored from jpeg-js (Apache-2.0, see notice above).
+// ---------------------------------------------------------------------------
+var btoa=btoa||function(r){return Buffer.from(r).toString("base64")};function JPEGEncoder(r){Math.round;var e,n,o,a,t,f=Math.floor,i=new Array(64),v=new Array(64),d=new Array(64),u=new Array(64),c=new Array(65535),w=new Array(65535),h=new Array(64),g=new Array(64),y=[],m=0,A=7,s=new Array(64),l=new Array(64),p=new Array(64),E=new Array(256),j=new Array(2048),D=[0,1,5,6,14,15,27,28,2,4,7,13,16,26,29,42,3,8,12,17,25,30,41,43,9,11,18,24,31,40,44,53,10,19,23,32,39,45,52,54,20,22,33,38,46,51,55,60,21,34,37,47,50,56,59,61,35,36,48,49,57,58,62,63],I=[0,0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0],B=[0,1,2,3,4,5,6,7,8,9,10,11],C=[0,0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,125],M=[1,2,3,0,4,17,5,18,33,49,65,6,19,81,97,7,34,113,20,50,129,145,161,8,35,66,177,193,21,82,209,240,36,51,98,114,130,9,10,22,23,24,25,26,37,38,39,40,41,42,52,53,54,55,56,57,58,67,68,69,70,71,72,73,74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105,106,115,116,117,118,119,120,121,122,131,132,133,134,135,136,137,138,146,147,148,149,150,151,152,153,154,162,163,164,165,166,167,168,169,170,178,179,180,181,182,183,184,185,186,194,195,196,197,198,199,200,201,202,210,211,212,213,214,215,216,217,218,225,226,227,228,229,230,231,232,233,234,241,242,243,244,245,246,247,248,249,250],b=[0,0,3,1,1,1,1,1,1,1,1,1,0,0,0,0,0],x=[0,1,2,3,4,5,6,7,8,9,10,11],T=[0,0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,119],G=[0,1,2,3,17,4,5,33,49,6,18,65,81,7,97,113,19,34,50,129,8,20,66,145,161,177,193,9,35,51,82,240,21,98,114,209,10,22,36,52,225,37,241,23,24,25,26,38,39,40,41,42,53,54,55,56,57,58,67,68,69,70,71,72,73,74,83,84,85,86,87,88,89,90,99,100,101,102,103,104,105,106,115,116,117,118,119,120,121,122,130,131,132,133,134,135,136,137,138,146,147,148,149,150,151,152,153,154,162,163,164,165,166,167,168,169,170,178,179,180,181,182,183,184,185,186,194,195,196,197,198,199,200,201,202,210,211,212,213,214,215,216,217,218,226,227,228,229,230,231,232,233,234,242,243,244,245,246,247,248,249,250];function J(r,e){for(var n=0,o=0,a=new Array,t=1;t<=16;t++){for(var f=1;f<=r[t];f++)a[e[o]]=[],a[e[o]][0]=n,a[e[o]][1]=t,o++,n++;n*=2}return a}function P(r){for(var e=r[0],n=r[1]-1;n>=0;)e&1<<n&&(m|=1<<A),n--,--A<0&&(255==m?(S(255),S(0)):S(m),A=7,m=0)}function S(r){y.push(r)}function _(r){S(r>>8&255),S(255&r)}function F(r,e,n,o,a){for(var t,f=a[0],i=a[240],v=function(r,e){var n,o,a,t,f,i,v,d,u,c,w=0;for(u=0;u<8;++u){n=r[w],o=r[w+1],a=r[w+2],t=r[w+3],f=r[w+4],i=r[w+5],v=r[w+6];var g=n+(d=r[w+7]),y=n-d,m=o+v,A=o-v,s=a+i,l=a-i,p=t+f,E=t-f,j=g+p,D=g-p,I=m+s,B=m-s;r[w]=j+I,r[w+4]=j-I;var C=.707106781*(B+D);r[w+2]=D+C,r[w+6]=D-C;var M=.382683433*((j=E+l)-(B=A+y)),b=.5411961*j+M,x=1.306562965*B+M,T=.707106781*(I=l+A),G=y+T,J=y-T;r[w+5]=J+b,r[w+3]=J-b,r[w+1]=G+x,r[w+7]=G-x,w+=8}for(w=0,u=0;u<8;++u){n=r[w],o=r[w+8],a=r[w+16],t=r[w+24],f=r[w+32],i=r[w+40],v=r[w+48];var P=n+(d=r[w+56]),S=n-d,_=o+v,F=o-v,N=a+i,U=a-i,k=t+f,q=t-f,z=P+k,H=P-k,K=_+N,L=_-N;r[w]=z+K,r[w+32]=z-K;var O=.707106781*(L+H);r[w+16]=H+O,r[w+48]=H-O;var Q=.382683433*((z=q+U)-(L=F+S)),R=.5411961*z+Q,V=1.306562965*L+Q,W=.707106781*(K=U+F),X=S+W,Y=S-W;r[w+40]=Y+R,r[w+24]=Y-R,r[w+8]=X+V,r[w+56]=X-V,w++}for(u=0;u<64;++u)c=r[u]*e[u],h[u]=c>0?c+.5|0:c-.5|0;return h}(r,e),d=0;d<64;++d)g[D[d]]=v[d];var u=g[0]-n;n=g[0],0==u?P(o[0]):(P(o[w[t=32767+u]]),P(c[t]));for(var y=63;y>0&&0==g[y];y--);if(0==y)return P(f),n;for(var m,A=1;A<=y;){for(var s=A;0==g[A]&&A<=y;++A);var l=A-s;if(l>=16){m=l>>4;for(var p=1;p<=m;++p)P(i);l&=15}t=32767+g[A],P(a[(l<<4)+w[t]]),P(c[t]),A++}return 63!=y&&P(f),n}function N(r){if(r<=0&&(r=1),r>100&&(r=100),t!=r){(function(r){for(var e=[16,11,10,16,24,40,51,61,12,12,14,19,26,58,60,55,14,13,16,24,40,57,69,56,14,17,22,29,51,87,80,62,18,22,37,56,68,109,103,77,24,35,55,64,81,104,113,92,49,64,78,87,103,121,120,101,72,92,95,98,112,100,103,99],n=0;n<64;n++){var o=f((e[n]*r+50)/100);o<1?o=1:o>255&&(o=255),i[D[n]]=o}for(var a=[17,18,24,47,99,99,99,99,18,21,26,66,99,99,99,99,24,26,56,99,99,99,99,99,47,66,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99,99],t=0;t<64;t++){var c=f((a[t]*r+50)/100);c<1?c=1:c>255&&(c=255),v[D[t]]=c}for(var w=[1,1.387039845,1.306562965,1.175875602,1,.785694958,.5411961,.275899379],h=0,g=0;g<8;g++)for(var y=0;y<8;y++)d[h]=1/(i[D[h]]*w[g]*w[y]*8),u[h]=1/(v[D[h]]*w[g]*w[y]*8),h++})(r<50?Math.floor(5e3/r):Math.floor(200-2*r)),t=r}}this.encode=function(r,t){var f;(new Date).getTime();t&&N(t),y=new Array,m=0,A=7,_(65496),_(65504),_(16),S(74),S(70),S(73),S(70),S(0),S(1),S(1),S(0),_(1),_(1),S(0),S(0),void 0!==(f=r.comments)&&f.constructor===Array&&f.forEach(r=>{if("string"==typeof r){_(65534);var e,n=r.length;for(_(n+2),e=0;e<n;e++)S(r.charCodeAt(e))}}),function(r){if(r){_(65505),69===r[0]&&120===r[1]&&105===r[2]&&102===r[3]?_(r.length+2):(_(r.length+5+2),S(69),S(120),S(105),S(102),S(0));for(var e=0;e<r.length;e++)S(r[e])}}(r.exifBuffer),function(){_(65499),_(132),S(0);for(var r=0;r<64;r++)S(i[r]);S(1);for(var e=0;e<64;e++)S(v[e])}(),function(r,e){_(65472),_(17),S(8),_(e),_(r),S(3),S(1),S(17),S(0),S(2),S(17),S(1),S(3),S(17),S(1)}(r.width,r.height),function(){_(65476),_(418),S(0);for(var r=0;r<16;r++)S(I[r+1]);for(var e=0;e<=11;e++)S(B[e]);S(16);for(var n=0;n<16;n++)S(C[n+1]);for(var o=0;o<=161;o++)S(M[o]);S(1);for(var a=0;a<16;a++)S(b[a+1]);for(var t=0;t<=11;t++)S(x[t]);S(17);for(var f=0;f<16;f++)S(T[f+1]);for(var i=0;i<=161;i++)S(G[i])}(),_(65498),_(12),S(3),S(1),S(0),S(2),S(17),S(3),S(17),S(0),S(63),S(0);var c=0,w=0,h=0;m=0,A=7,this.encode.displayName="_encode_";for(var g,E,D,J,U,k,q,z,H,K=r.data,L=r.width,O=r.height,Q=4*L,R=0;R<O;){for(g=0;g<Q;){for(k=U=Q*R+g,q=-1,z=0,H=0;H<64;H++)k=U+(z=H>>3)*Q+(q=4*(7&H)),R+z>=O&&(k-=Q*(R+1+z-O)),g+q>=Q&&(k-=g+q-Q+4),E=K[k++],D=K[k++],J=K[k++],s[H]=(j[E]+j[D+256|0]+j[J+512|0]>>16)-128,l[H]=(j[E+768|0]+j[D+1024|0]+j[J+1280|0]>>16)-128,p[H]=(j[E+1280|0]+j[D+1536|0]+j[J+1792|0]>>16)-128;c=F(s,d,c,e,o),w=F(l,u,w,n,a),h=F(p,u,h,n,a),g+=32}R+=8}if(A>=0){var V=[];V[1]=A+1,V[0]=(1<<A+1)-1,P(V)}return _(65497),"undefined"==typeof module?new Uint8Array(y):Buffer.from(y)},function(){(new Date).getTime();r||(r=50),function(){for(var r=String.fromCharCode,e=0;e<256;e++)E[e]=r(e)}(),e=J(I,B),n=J(b,x),o=J(C,M),a=J(T,G),function(){for(var r=1,e=2,n=1;n<=15;n++){for(var o=r;o<e;o++)w[32767+o]=n,c[32767+o]=[],c[32767+o][1]=n,c[32767+o][0]=o;for(var a=-(e-1);a<=-r;a++)w[32767+a]=n,c[32767+a]=[],c[32767+a][1]=n,c[32767+a][0]=e-1+a;r<<=1,e<<=1}}(),function(){for(var r=0;r<256;r++)j[r]=19595*r,j[r+256|0]=38470*r,j[r+512|0]=7471*r+32768,j[r+768|0]=-11059*r,j[r+1024|0]=-21709*r,j[r+1280|0]=32768*r+8421375,j[r+1536|0]=-27439*r,j[r+1792|0]=-5329*r}(),N(r),(new Date).getTime()}()}function encode(r,e){return void 0===e&&(e=50),{data:new JPEGEncoder(e).encode(r,e),width:r.width,height:r.height}}function getImageDataFromImage(r){var e="string"==typeof r?document.getElementById(r):r,n=document.createElement("canvas");n.width=e.width,n.height=e.height;var o=n.getContext("2d");return o.drawImage(e,0,0),o.getImageData(0,0,n.width,n.height)}
+
+// Encode RGB pixels as a JPEG at the given quality (1-100).
+function encodeJpeg(rgb, w, h, quality) {
+  const rgba = Buffer.allocUnsafe(w * h * 4);
+  for (let i = 0, j = 0; j < rgba.length; i += 3, j += 4) {
+    rgba[j] = rgb[i];
+    rgba[j + 1] = rgb[i + 1];
+    rgba[j + 2] = rgb[i + 2];
+    rgba[j + 3] = 255;
+  }
+  const out = encode({ data: rgba, width: w, height: h }, quality);
+  return Buffer.from(out.data);
+}
+
 // Shrink one data URL if it is over the size limit or the pixel budget.
 // Returns { url, changed, beforeB64, afterB64, beforePx, afterPx } or null when
 // the image cannot be handled (non-PNG, or still too big after resizing).
@@ -832,8 +907,17 @@ function downscaleDataUrl(url) {
   const b64 = url.slice(comma + 1);
   let buf;
   try { buf = Buffer.from(b64, "base64"); } catch { return null; }
-  const img = decodePng(buf);
-  if (!img) return null; // JPEG/WebP/etc: cannot shrink without a codec
+  const srcJpeg = isJpeg(buf);
+  let img = decodePng(buf);
+  if (!img && srcJpeg) img = decodeJpegFull(buf);
+  if (!img) return null; // WebP and other formats: cannot shrink without a codec
+
+  // JPEG sources are re-encoded as JPEG: a lossless PNG of a photo is several
+  // times larger and would force a much harsher resolution cut to stay under the
+  // body limit. PNG sources keep their exact pixels.
+  const encodeOut = (rgb, w, h) =>
+    srcJpeg ? encodeJpeg(rgb, w, h, DOWNSCALE_JPEG_QUALITY) : encodePng(rgb, w, h);
+  const outMime = srcJpeg ? "image/jpeg" : "image/png";
 
   const px = img.w * img.h;
   const longSide = Math.max(img.w, img.h);
@@ -844,24 +928,30 @@ function downscaleDataUrl(url) {
   let scale = Math.min(1, Math.sqrt(DOWNSCALE_MAX_PIXELS / px));
   if (longSide * scale > DOWNSCALE_MAX_SIDE) scale = DOWNSCALE_MAX_SIDE / longSide;
 
-  // Shrink until the encoded payload fits; each step also drops pixels.
+  // Shrink until the encoded payload fits. The pixel target above is the goal;
+  // the base64 target is only a hard ceiling, so step down gently to avoid
+  // collapsing the image.
   let nw = Math.max(1, Math.round(img.w * scale));
   let nh = Math.max(1, Math.round(img.h * scale));
   let outBuf = null, outB64 = "";
-  for (let attempt = 0; attempt < 6; attempt++) {
+  for (let attempt = 0; attempt < 8; attempt++) {
     const rgb = resizeBox(img, nw, nh);
-    outBuf = encodePng(rgb, nw, nh);
+    outBuf = encodeOut(rgb, nw, nh);
     outB64 = outBuf.toString("base64");
     if (outB64.length <= DOWNSCALE_TARGET_B64) break;
     if (nw <= 32 || nh <= 32) break;
-    const f = Math.sqrt(DOWNSCALE_TARGET_B64 / outB64.length) * 0.92;
-    nw = Math.max(1, Math.round(nw * Math.min(f, 0.9)));
-    nh = Math.max(1, Math.round(nh * Math.min(f, 0.9)));
+    // Area scales with the square of the side, so shrink by the square root of
+    // the overshoot, but never by more than 30% in one step.
+    const f = Math.max(0.7, Math.min(0.9, Math.sqrt(DOWNSCALE_TARGET_B64 / outB64.length) * 0.95));
+    nw = Math.max(1, Math.round(nw * f));
+    nh = Math.max(1, Math.round(nh * f));
   }
-  if (!outB64 || outB64.length >= b64.length) return null; // no gain
+  // Accept whenever the image actually got smaller in pixels; the base64 ceiling
+  // above still keeps the request under the backend body limit.
+  if (!outB64 || nw * nh >= px) return null;
 
   return {
-    url: `data:image/png;base64,${outB64}`,
+    url: `data:${outMime};base64,${outB64}`,
     changed: true,
     beforeB64: b64.length,
     afterB64: outB64.length,
@@ -1486,13 +1576,13 @@ async function handleChatCompletions(req, res) {
     const mediaMb = (media.bytes / 1048576).toFixed(2);
     const tried = shrunk.length
       ? ` The proxy already downscaled ${shrunk.length} image(s) and the body is still over.`
-      : ` The proxy could not downscale this attachment: it can only shrink PNGs.`;
+      : ` The proxy could not downscale this attachment (only PNG and JPEG can be resized).`;
     return json(res, 413, openAIError(
       `Request body is ${bodyChars.toLocaleString("en-US")} characters, over the backend's ` +
       `${REQUEST_BODY_LIMIT_CHARS.toLocaleString("en-US")}-character limit (${overBy} too many). ` +
       `Largest attachment: ${mediaMb} MB of base64.` + tried +
       ` This is a payload-size cap, not a context-length problem — dropping history cannot help. ` +
-      `Convert the image to PNG (auto-downscaled), or re-encode it as JPEG/WebP and resize to <=1568px.`,
+      `Convert the image to PNG or JPEG (both auto-downscaled), or resize it to <=1568px.`,
       "context_too_long"));
   }
 
