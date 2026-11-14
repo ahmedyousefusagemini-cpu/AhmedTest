@@ -583,9 +583,73 @@ function normalizeBody(body) {
 
 // ---------- context-overflow recovery ----------
 
-// Rough token estimate (chars/4 for text, a flat cost for media). It only
-// decides which turns to drop; the backend stays the authority, so anything we
-// think is fine is still sent as-is first.
+// Rough token estimate. It only decides which turns to drop; the backend stays
+// the authority, so anything we think is fine is still sent as-is first.
+//
+// Media cost model, measured against the real backend: images are billed by
+// PIXEL DIMENSIONS, not by byte size. Two 768x768 images whose base64 bodies
+// were 570 KB vs 57 KB both reported exactly 799 prompt_tokens, and observed
+// cost tracks ~px/763 + 35 (64x64 -> 31, 512x512 -> 376, 1024x1024 -> 1384,
+// 2048x2048 -> 5491). So a 1-4 MB screenshot is only a few thousand tokens.
+// Charging the base64 length instead (an earlier bug) made every attachment
+// look like an overflow -- the opposite failure. Bill pixels.
+const MEDIA_TOKENS_PER_PIXEL = 1 / 763;
+const MEDIA_FIXED_TOKENS = 35;
+const MEDIA_UNKNOWN_TOKENS = 800; // no parseable dimensions
+
+// Read WxH from PNG/JPEG/GIF/WebP headers in a data URL -- no image decoding.
+function imagePixelCount(buf) {
+  try {
+    if (buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47) {
+      return buf.readUInt32BE(16) * buf.readUInt32BE(20); // PNG IHDR
+    }
+    if (buf.length > 10 && buf.toString("ascii", 0, 3) === "GIF") {
+      return buf.readUInt16LE(6) * buf.readUInt16LE(8);
+    }
+    if (buf.length > 30 && buf.toString("ascii", 0, 4) === "RIFF" &&
+        buf.toString("ascii", 8, 12) === "WEBP") {
+      const fmt = buf.toString("ascii", 12, 16);
+      if (fmt === "VP8X") return (buf.readUIntLE(24, 3) + 1) * (buf.readUIntLE(27, 3) + 1);
+      if (fmt === "VP8 ") return (buf.readUInt16LE(26) & 0x3fff) * (buf.readUInt16LE(28) & 0x3fff);
+      if (fmt === "VP8L") {
+        const b = buf.readUInt32LE(21);
+        return ((b & 0x3fff) + 1) * (((b >> 14) & 0x3fff) + 1);
+      }
+    }
+    if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) { // JPEG SOFn
+      let i = 2;
+      while (i + 9 < buf.length) {
+        if (buf[i] !== 0xff) { i++; continue; }
+        const marker = buf[i + 1];
+        if (marker >= 0xc0 && marker <= 0xcf &&
+            marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return buf.readUInt16BE(i + 7) * buf.readUInt16BE(i + 5);
+        }
+        i += 2 + buf.readUInt16BE(i + 2);
+      }
+    }
+  } catch { /* truncated header: fall through */ }
+  return 0;
+}
+
+function mediaTokens(url) {
+  if (typeof url !== "string" || !url) return MEDIA_UNKNOWN_TOKENS;
+  if (!url.startsWith("data:")) {
+    // Remote URL: the backend fetches it and bills its real dimensions, which
+    // we cannot see. Assume a moderately large image rather than zero.
+    return Math.ceil(1024 * 1024 * MEDIA_TOKENS_PER_PIXEL) + MEDIA_FIXED_TOKENS;
+  }
+  const comma = url.indexOf(",");
+  if (comma < 0) return MEDIA_UNKNOWN_TOKENS;
+  const meta = url.slice(5, comma);
+  let px = 0;
+  if (/;base64/i.test(meta)) {
+    try { px = imagePixelCount(Buffer.from(url.slice(comma + 1), "base64")); } catch { px = 0; }
+  }
+  if (!px) return MEDIA_UNKNOWN_TOKENS;
+  return Math.ceil(px * MEDIA_TOKENS_PER_PIXEL) + MEDIA_FIXED_TOKENS;
+}
+
 function estimateTokens(value) {
   if (value == null) return 0;
   if (typeof value === "string") return Math.ceil(value.length / 4);
@@ -595,7 +659,15 @@ function estimateTokens(value) {
     value.type === "image_url" || value.type === "image" ||
     value.type === "input_image" || value.type === "video_url"
   ) {
-    return 1500;
+    const raw = value.image_url ?? value.source ?? value;
+    const url =
+      typeof raw === "string" ? raw :
+      typeof raw?.url === "string" ? raw.url : "";
+    // Anthropic-style inline base64 keeps the bytes in source.data.
+    const data = typeof raw?.data === "string"
+      ? `data:${raw.media_type || "image/png"};base64,${raw.data}`
+      : "";
+    return mediaTokens(url || data);
   }
   let n = 0;
   for (const v of Object.values(value)) n += estimateTokens(v);
@@ -687,8 +759,15 @@ async function fetchUpstreamWithCompaction(token, upstreamBody, turnId) {
       Math.floor(before * COMPACT_KEEP_RATIO)
     );
     const next = compactBody(body, budget);
-    if (!next || estimateBodyTokens(next) >= before) {
+    const after = next ? estimateBodyTokens(next) : before;
+    if (!next || after >= before) {
       return { resp, text, body, compacted, overflow: true };
+    }
+    // If trimming can only shave a sliver, the request is dominated by content
+    // that survives every compaction (a very large attachment). Retrying just
+    // burns the allowance and ends on the same 413, so report the real cause.
+    if (before - after < Math.max(2000, before * 0.02)) {
+      return { resp, text, body, compacted, overflow: true, mediaBound: true };
     }
     let code = "";
     try {
@@ -1174,7 +1253,9 @@ async function handleChatCompletions(req, res) {
     const overflow = call.overflow === true || isContextOverflow(upstream.status, text);
     const hint =
       overflow
-        ? " (the proxy already dropped the oldest turns and the request still does not fit — start a new chat, or lower the attached files/context)"
+        ? call.mediaBound
+          ? " (an attachment is so large it fills the model window on its own — remove or shrink it; dropping older messages cannot help)"
+          : " (the proxy already dropped the oldest turns and the request still does not fit — start a new chat, or lower the attached files/context)"
         : upstream.status === 401
           ? " (free-pi sign-in expired — run `npx free-pi-cli@latest` to sign in again)"
           : upstream.status === 426
