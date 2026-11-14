@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { Readable, Transform } from "node:stream";
 import { execFile } from "node:child_process";
 import { McpManager } from "./mcp.mjs";
