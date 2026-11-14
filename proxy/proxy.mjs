@@ -634,11 +634,15 @@ function imagePixelCount(buf) {
 }
 
 // The backend rejects a request body of roughly 0.94 MB and up with the
-// misleading "This conversation is too long" 413 -- measured: a 200x200 image
-// (79 prompt tokens) succeeded at a 0.951 MB body and failed at 0.959 MB, while
-// identical pixels reached 413 once the base64 padding crossed ~1 MB. So the cap
-// is BYTE SIZE of the request, not pixels and not tokens. Compaction can never
-// fix this (the attachment survives every trim), so detect it up front.
+// misleading "This conversation is too long" 413. Measured against the live
+// backend, the cap is a flat limit on the JSON CHARACTER COUNT of the request
+// body -- not bytes, pixels or tokens. Binary-searched boundary: 999,907 chars
+// succeeded, 1,000,407 chars returned 413. That is why ASCII prose (1 byte per
+// char) fails near 1 MB while CJK (3 bytes per char) fits 2.5 MB of text inside
+// the same 1M-character budget. Compaction can never fix an oversized ATTACHMENT
+// (it survives every trim), so compare characters, not bytes.
+const REQUEST_BODY_LIMIT_CHARS = 1_000_000;
+// Only used to decide whether an attachment dominates the body.
 const REQUEST_BODY_LIMIT_BYTES = 940_000;
 
 function mediaTokens(url) {
@@ -684,9 +688,9 @@ function largestMediaBytes(body) {
 
 // ---------- attachment downscaling ----------
 //
-// The backend rejects a request body over ~0.94 MB (see
-// REQUEST_BODY_LIMIT_BYTES), and base64 costs 4/3 of the file size, so inline
-// attachments must stay under roughly 700 KB. Rather than reject the user's
+// The backend rejects a request body over 1,000,000 JSON characters (see
+// REQUEST_BODY_LIMIT_CHARS). Base64 expands bytes by 4/3, so an inline
+// attachment quickly eats that character budget. Rather than reject the user's
 // 1-4 MB screenshot, shrink it here: decode PNG in pure JS (node:zlib only, no
 // native dependency so the workflow needs no npm install), box-filter down to a
 // sane pixel budget, and re-encode as PNG. Images we cannot decode (JPEG/WebP)
@@ -696,8 +700,8 @@ const DOWNSCALE_ENABLED = process.env.FREEPI_PROXY_DOWNSCALE !== "0";
 // tokens. Long side is capped separately so panoramas stay readable.
 const DOWNSCALE_MAX_PIXELS = Number(process.env.FREEPI_PROXY_MAX_IMAGE_PIXELS || 1150000);
 const DOWNSCALE_MAX_SIDE = Number(process.env.FREEPI_PROXY_MAX_IMAGE_SIDE || 1800);
-// Target base64 bytes for a single attachment (leaves room for the rest of the
-// body under the ~0.94 MB cap).
+// Target base64 characters for a single attachment (leaves room for the rest of
+// the body under the 1,000,000-character cap).
 const DOWNSCALE_TARGET_B64 = Number(process.env.FREEPI_PROXY_IMAGE_BYTES || 620000);
 
 const PNG_SIG = 0x89504e47;
@@ -1473,17 +1477,20 @@ async function handleChatCompletions(req, res) {
   // that is large because of text is different -- compaction really can fix it,
   // so those requests are still forwarded and left to the normal retry path.
   const media = largestMediaBytes(upstreamBody);
-  const bodyBytes = Buffer.byteLength(JSON.stringify(upstreamBody));
+  const bodyJson = JSON.stringify(upstreamBody);
+  const bodyChars = bodyJson.length;
+  const bodyBytes = Buffer.byteLength(bodyJson);
   const attachmentDominates = media.bytes > REQUEST_BODY_LIMIT_BYTES * 0.5;
-  if (bodyBytes > REQUEST_BODY_LIMIT_BYTES && attachmentDominates) {
-    const overBy = ((bodyBytes - REQUEST_BODY_LIMIT_BYTES) / 1024).toFixed(0);
+  if (bodyChars > REQUEST_BODY_LIMIT_CHARS && attachmentDominates) {
+    const overBy = (bodyChars - REQUEST_BODY_LIMIT_CHARS).toLocaleString("en-US");
     const mediaMb = (media.bytes / 1048576).toFixed(2);
     const tried = shrunk.length
       ? ` The proxy already downscaled ${shrunk.length} image(s) and the body is still over.`
       : ` The proxy could not downscale this attachment: it can only shrink PNGs.`;
     return json(res, 413, openAIError(
-      `Request body is ${(bodyBytes / 1048576).toFixed(2)} MB, over the backend's ~${(REQUEST_BODY_LIMIT_BYTES / 1048576).toFixed(2)} MB limit ` +
-      `(${overBy} KB too large). Largest attachment: ${mediaMb} MB of base64.` + tried +
+      `Request body is ${bodyChars.toLocaleString("en-US")} characters, over the backend's ` +
+      `${REQUEST_BODY_LIMIT_CHARS.toLocaleString("en-US")}-character limit (${overBy} too many). ` +
+      `Largest attachment: ${mediaMb} MB of base64.` + tried +
       ` This is a payload-size cap, not a context-length problem — dropping history cannot help. ` +
       `Convert the image to PNG (auto-downscaled), or re-encode it as JPEG/WebP and resize to <=1568px.`,
       "context_too_long"));
