@@ -960,7 +960,7 @@ function encodeJpeg(rgb, w, h, quality) {
 // Shrink one data URL if it is over the size limit or the pixel budget.
 // Returns { url, changed, beforeB64, afterB64, beforePx, afterPx } or null when
 // the image cannot be handled (non-PNG, or still too big after resizing).
-function downscaleDataUrl(url) {
+function downscaleDataUrl(url, targetB64 = DOWNSCALE_TARGET_B64) {
   if (!DOWNSCALE_ENABLED) return null;
   if (typeof url !== "string" || !url.startsWith("data:")) return null;
   const comma = url.indexOf(",");
@@ -984,7 +984,7 @@ function downscaleDataUrl(url) {
 
   const px = img.w * img.h;
   const longSide = Math.max(img.w, img.h);
-  const overBytes = b64.length > DOWNSCALE_TARGET_B64;
+  const overBytes = b64.length > targetB64;
   const overPixels = px > DOWNSCALE_MAX_PIXELS || longSide > DOWNSCALE_MAX_SIDE;
   if (!overBytes && !overPixels) return null; // already fine, don't touch it
 
@@ -1001,11 +1001,11 @@ function downscaleDataUrl(url) {
     const rgb = resizeBox(img, nw, nh);
     outBuf = encodeOut(rgb, nw, nh);
     outB64 = outBuf.toString("base64");
-    if (outB64.length <= DOWNSCALE_TARGET_B64) break;
+    if (outB64.length <= targetB64) break;
     if (nw <= 32 || nh <= 32) break;
     // Area scales with the square of the side, so shrink by the square root of
     // the overshoot, but never by more than 30% in one step.
-    const f = Math.max(0.7, Math.min(0.9, Math.sqrt(DOWNSCALE_TARGET_B64 / outB64.length) * 0.95));
+    const f = Math.max(0.7, Math.min(0.9, Math.sqrt(targetB64 / outB64.length) * 0.95));
     nw = Math.max(1, Math.round(nw * f));
     nh = Math.max(1, Math.round(nh * f));
   }
@@ -1018,14 +1018,56 @@ function downscaleDataUrl(url) {
     changed: true,
     beforeB64: b64.length,
     afterB64: outB64.length,
+    targetB64,
     beforePx: px,
     afterPx: nw * nh,
   };
 }
 
+// Room left for attachments once the TEXT part of the body is accounted for.
+//
+// The flat DOWNSCALE_TARGET_B64 (620K chars) is fine in a fresh chat, but with a
+// long history (~800K chars of text) one image at that size pushes the body over
+// the backend's 1M-character cap and the request fails with a 413 that blames the
+// image -- even though the image was the smaller half. Measure the body without
+// its attachment payloads and hand the images what is actually left, split
+// across them.
+function attachmentBudget(body) {
+  let mediaChars = 0;
+  let imageCount = 0;
+  const walk = (v) => {
+    if (v == null) return;
+    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+    if (typeof v !== "object") return;
+    const t = v.type;
+    if (t === "image_url" || t === "image" || t === "input_image") {
+      const raw = v.image_url ?? v.source ?? v;
+      const url = typeof raw === "string" ? raw : (typeof raw?.url === "string" ? raw.url : "");
+      const data = typeof raw?.data === "string" ? raw.data : "";
+      if (url.startsWith("data:") || data) {
+        mediaChars += Math.max(url.length, data.length);
+        imageCount += 1;
+      }
+      return;
+    }
+    for (const x of Object.values(v)) walk(x);
+  };
+  walk(body?.messages);
+  if (!imageCount) return DOWNSCALE_TARGET_B64;
+  const skeletonChars = Math.max(0, JSON.stringify(body ?? {}).length - mediaChars);
+  const roomLeft = REQUEST_BODY_LIMIT_CHARS - skeletonChars;
+  // 10% margin for the JSON envelope. The 120K floor keeps images readable, but
+  // must never win over the cap: when the text alone leaves less than that, the
+  // budget follows the real room (downscaling a text-heavy body is hopeless, and
+  // the 413 tells the user to trim the conversation instead).
+  const perImage = Math.floor((roomLeft * 0.9) / imageCount);
+  return Math.max(12000, Math.min(DOWNSCALE_TARGET_B64, perImage));
+}
+
 // Walk the body and downscale every inline image that is over budget.
 function downscaleBodyImages(body) {
   const report = [];
+  const targetB64 = attachmentBudget(body);
   const walk = (v) => {
     if (v == null) return;
     if (Array.isArray(v)) { for (const x of v) walk(x); return; }
@@ -1036,7 +1078,7 @@ function downscaleBodyImages(body) {
       const isStr = typeof raw === "string";
       const cur = isStr ? raw : (typeof raw?.url === "string" ? raw.url : "");
       const inline = typeof raw?.data === "string" ? `data:${raw.media_type || "image/png"};base64,${raw.data}` : "";
-      const r = downscaleDataUrl(cur || inline);
+      const r = downscaleDataUrl(cur || inline, targetB64);
       if (r) {
         if (isStr) v.image_url = r.url;
         else if (typeof v.image_url === "object" && v.image_url) v.image_url.url = r.url;
@@ -1621,7 +1663,7 @@ async function handleChatCompletions(req, res) {
       `[downscale] ${shrunk.length} image(s): ` +
       shrunk.map((r) => `${r.beforePx}px/${(r.beforeB64 / 1048576).toFixed(2)}MB -> ` +
         `${r.afterPx}px/${(r.afterB64 / 1048576).toFixed(2)}MB`).join(", ") +
-      ` (saved ${(saved / 1048576).toFixed(2)} MB of base64)`
+      ` (saved ${(saved / 1048576).toFixed(2)} MB of base64, per-image budget ${(shrunk[0].targetB64 / 1000).toFixed(0)}K chars)`
     );
   }
 
@@ -1640,12 +1682,20 @@ async function handleChatCompletions(req, res) {
     const tried = shrunk.length
       ? ` The proxy already downscaled ${shrunk.length} image(s) and the body is still over.`
       : ` The proxy could not downscale this attachment (only PNG and JPEG can be resized).`;
+    // Say where the bulk actually is. When the text is most of the body, further
+    // downscaling cannot fix it and telling the user to resize wastes their time.
+    const mediaShare = media.bytes / bodyChars;
+    const textChars = Math.max(0, bodyChars - media.bytes);
+    const advice = mediaShare >= 0.6
+      ? `The largest attachment is ${(mediaShare * 100).toFixed(0)}% of the body. ` +
+        `Resize it to <=1568px, or convert it to JPEG (both auto-downscaled).`
+      : `The conversation text alone is ${textChars.toLocaleString("en-US")} characters ` +
+        `(${((1 - mediaShare) * 100).toFixed(0)}% of the body), so shrinking the image cannot get ` +
+        `this under the cap. Start a new chat, remove large pasted files or tool output, or trim earlier turns.`;
     return json(res, 413, openAIError(
       `Request body is ${bodyChars.toLocaleString("en-US")} characters, over the backend's ` +
       `${REQUEST_BODY_LIMIT_CHARS.toLocaleString("en-US")}-character limit (${overBy} too many). ` +
-      `Largest attachment: ${mediaMb} MB of base64.` + tried +
-      ` This is a payload-size cap, not a context-length problem — dropping history cannot help. ` +
-      `Convert the image to PNG or JPEG (both auto-downscaled), or resize it to <=1568px.`,
+      `Largest attachment: ${mediaMb} MB of base64.` + tried + ` ` + advice,
       "context_too_long"));
   }
 
