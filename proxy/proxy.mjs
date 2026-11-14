@@ -753,15 +753,60 @@ function decodePng(buf) {
   // Only 8- and 16-bit, non-interlaced images are supported. Palette (ct 3)
   // images are rare for screenshots and are left to the caller.
   if (!w || !h || inter) return null;
-  if (depth !== 8 && depth !== 16) return null;
+  // 1/2/4-bit images only occur for greyscale and palette data (bitDepth < 8).
+  if (depth !== 8 && depth !== 16 && depth !== 1 && depth !== 2 && depth !== 4) return null;
   const chan = ct === 2 ? 3 : ct === 6 ? 4 : ct === 0 ? 1 : ct === 4 ? 2 : null;
   if (!chan) return null;
   let raw;
   try { raw = zlib.inflateSync(Buffer.concat(idat)); } catch { return null; }
   // Filtering operates on bytes, so for 16-bit images the stride is in bytes and
   // each sample is two bytes (high byte first).
-  const bps = depth === 16 ? 2 : 1;
-  const stride = w * chan * bps;
+  // Sub-byte depths (1/2/4 bit greyscale) are expanded to 8-bit first: the
+  // filter step works on bytes, but each byte holds several pixels.
+  if (depth < 8) {
+    if (ct !== 0) return null; // only greyscale is handled at these depths
+    let rawLow;
+    try { rawLow = zlib.inflateSync(Buffer.concat(idat)); } catch { return null; }
+    const perByte = 8 / depth;
+    const rowBytes = Math.ceil(w / perByte);
+    const maxv = (1 << depth) - 1;
+    const out = Buffer.alloc(w * h);
+    let rp = 0;
+    let prev = Buffer.alloc(rowBytes);
+    for (let y = 0; y < h; y++) {
+      const ft = rawLow[rp++];
+      const line = rawLow.subarray(rp, rp + rowBytes); rp += rowBytes;
+      const cur = Buffer.alloc(rowBytes);
+      for (let x = 0; x < rowBytes; x++) {
+        const a = x >= 1 ? cur[x - 1] : 0;
+        const b = prev[x];
+        const c = x >= 1 ? prev[x - 1] : 0;
+        let v = line[x];
+        if (ft === 1) v += a;
+        else if (ft === 2) v += b;
+        else if (ft === 3) v += (a + b) >> 1;
+        else if (ft === 4) {
+          const pp = a + b - c;
+          const pa = Math.abs(pp - a), pb = Math.abs(pp - b), pc = Math.abs(pp - c);
+          v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+        }
+        cur[x] = v & 255;
+      }
+      for (let x = 0; x < w; x++) {
+        const byte = cur[x >> 3];
+        const shift = 8 - depth * ((x % perByte) + 1);
+        const val = (byte >> shift) & maxv;
+        out[y * w + x] = Math.round((val * 255) / maxv);
+      }
+      prev = cur;
+    }
+    return { w, h, chan: 1, data: out };
+  }
+  const sampleBytes = depth === 16 ? 2 : 1;
+  // PNG filters work on whole pixels, so the left-neighbour offset is the pixel
+  // size in bytes, not the size of one sample.
+  const bpp = chan * sampleBytes;
+  const stride = w * chan * sampleBytes;
   if (raw.length < (stride + 1) * h) return null;
   const filt = Buffer.alloc(h * stride);
   let pos = 0;
@@ -770,9 +815,9 @@ function decodePng(buf) {
     const line = raw.subarray(pos, pos + stride); pos += stride;
     const start = y * stride;
     for (let x = 0; x < stride; x++) {
-      const a = x >= bps ? filt[start + x - bps] : 0;
+      const a = x >= bpp ? filt[start + x - bpp] : 0;
       const b = y > 0 ? filt[start - stride + x] : 0;
-      const c = (y > 0 && x >= bps) ? filt[start - stride + x - bps] : 0;
+      const c = (y > 0 && x >= bpp) ? filt[start - stride + x - bpp] : 0;
       let v = line[x];
       if (ft === 1) v += a;
       else if (ft === 2) v += b;
@@ -784,6 +829,24 @@ function decodePng(buf) {
       }
       filt[start + x] = v & 255;
     }
+  }
+  // Flatten alpha to RGB: the backend only needs colour, and premultiplied
+  // RGBA data would otherwise be read as if it were plain RGB.
+  if (chan === 4) {
+    const out = Buffer.alloc(w * h * 3);
+    for (let i = 0, j = 0; j < out.length; i += 4, j += 3) {
+      const a = filt[i + 3];
+      if (a === 255) {
+        out[j] = filt[i]; out[j + 1] = filt[i + 1]; out[j + 2] = filt[i + 2];
+      } else {
+        // Composite over white so transparent areas do not turn black.
+        const t = a / 255;
+        out[j] = Math.round(filt[i] * t + 255 * (1 - t));
+        out[j + 1] = Math.round(filt[i + 1] * t + 255 * (1 - t));
+        out[j + 2] = Math.round(filt[i + 2] * t + 255 * (1 - t));
+      }
+    }
+    return { w, h, chan: 3, data: out };
   }
   if (depth === 8) return { w, h, chan, data: filt };
   // 16-bit: keep the high byte of each big-endian sample.
