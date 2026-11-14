@@ -1468,12 +1468,14 @@ async function handleChatCompletions(req, res) {
     );
   }
 
-  // Fail fast on an attachment the backend will reject regardless of history:
-  // its own 413 says "conversation is too long", which sends users chasing the
-  // wrong fix. The cap is the request body size (~0.94 MB measured).
+  // Fail fast only when an ATTACHMENT alone blows the body cap: trimming history
+  // cannot help there, and the backend's own 413 blames the conversation. A body
+  // that is large because of text is different -- compaction really can fix it,
+  // so those requests are still forwarded and left to the normal retry path.
   const media = largestMediaBytes(upstreamBody);
   const bodyBytes = Buffer.byteLength(JSON.stringify(upstreamBody));
-  if (bodyBytes > REQUEST_BODY_LIMIT_BYTES) {
+  const attachmentDominates = media.bytes > REQUEST_BODY_LIMIT_BYTES * 0.5;
+  if (bodyBytes > REQUEST_BODY_LIMIT_BYTES && attachmentDominates) {
     const overBy = ((bodyBytes - REQUEST_BODY_LIMIT_BYTES) / 1024).toFixed(0);
     const mediaMb = (media.bytes / 1048576).toFixed(2);
     const tried = shrunk.length
