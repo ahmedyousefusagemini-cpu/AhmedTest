@@ -83,6 +83,50 @@ const CREDENTIALS_PATH =
   process.env.FREEPI_CREDENTIALS_PATH || path.join(os.homedir(), ".free-pi", "agent", "credentials.json");
 
 const SESSION_ID = `proxy-${crypto.randomUUID()}`;
+
+// ---------- concurrency slot pool ----------
+// free-pi enforces two independent limits:
+//   * 1 in-flight request per x-session-id -> HTTP 429 code "concurrent"
+//   * 16 in-flight streams per account     -> HTTP 409 code "concurrent_session"
+// The backend keeps NO conversation state per session, so the session id is
+// purely a mutex. We keep a pool of distinct ids and hand one to each in-flight
+// request, so a single account can run N requests at once.
+const MAX_PARALLEL = Math.max(1, Math.min(16, Number(process.env.PROXY_MAX_PARALLEL || 16)));
+const SLOT_IDS = Array.from({ length: MAX_PARALLEL }, () => `proxy-${crypto.randomUUID()}`);
+const freeSlots = [...SLOT_IDS];
+const slotWaiters = [];
+const slotStats = { inFlight: 0, peak: 0, total: 0 };
+
+function acquireSlot() {
+  const id = freeSlots.pop();
+  if (id !== undefined) {
+    slotStats.inFlight++;
+    slotStats.total++;
+    if (slotStats.inFlight > slotStats.peak) slotStats.peak = slotStats.inFlight;
+    return Promise.resolve(id);
+  }
+  return new Promise((resolve) => slotWaiters.push(resolve));
+}
+
+function releaseSlot(id) {
+  slotStats.inFlight--;
+  const next = slotWaiters.shift();
+  if (next) {
+    slotStats.inFlight++;
+    if (slotStats.inFlight > slotStats.peak) slotStats.peak = slotStats.inFlight;
+    next(id);
+  } else {
+    freeSlots.push(id);
+  }
+}
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isConcurrencyError(status, text) {
+  if (status !== 429 && status !== 409) return false;
+  return /one request at a time|concurrent/i.test(text || "");
+}
+
 // Any request with a missing/unknown model name is routed here, so generic
 // OpenAI clients (which send e.g. "gpt-4o") work without knowing the catalog.
 const DEFAULT_MODEL = process.env.FREEPI_PROXY_DEFAULT_MODEL || "glm-5.3-flash";
@@ -341,10 +385,10 @@ function loadToken() {
   return credCache.token;
 }
 
-function upstreamHeaders(token, turnId) {
+function upstreamHeaders(token, turnId, sessionId) {
   return {
     authorization: `Bearer ${token}`,
-    "x-session-id": SESSION_ID,
+    "x-session-id": sessionId || SESSION_ID,
     "x-client-version": getClientVersion(),
     ...(turnId ? { "x-turn-id": turnId } : {}),
     "content-type": "application/json",
@@ -1253,11 +1297,28 @@ function isMcpTool(name) {
 
 // Run upstream chat completions against the backend with explicit body.
 async function upstreamCall(token, upstreamBody, turnId) {
-  return fetch(`${BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: upstreamHeaders(token, turnId),
-    body: JSON.stringify(upstreamBody),
-  });
+  const maxAttempts = 8;
+  let lastResp = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const slot = await acquireSlot();
+    let retryable = false;
+    try {
+      const resp = await fetch(`${BASE}/v1/chat/completions`, {
+        method: "POST",
+        headers: upstreamHeaders(token, turnId, slot),
+        body: JSON.stringify(upstreamBody),
+      });
+      if (resp.status !== 429 && resp.status !== 409) return resp;
+      const text = await resp.clone().text().catch(() => "");
+      lastResp = resp;
+      retryable = isConcurrencyError(resp.status, text);
+      if (!retryable || attempt === maxAttempts - 1) return resp;
+    } finally {
+      releaseSlot(slot);
+    }
+    if (retryable) await sleepMs(Math.min(3000, 300 * 2 ** attempt) + Math.random() * 250);
+  }
+  return lastResp;
 }
 
 // When MCP tools are active, run a server-side agentic loop: execute
@@ -1752,10 +1813,12 @@ async function handleChatCompletions(req, res) {
           ? " (free-pi sign-in expired — run `npx free-pi-cli@latest` to sign in again)"
           : upstream.status === 426
             ? ` (proxy sent client version ${sentVersion} and could not self-heal; run \`npx free-pi-cli@latest\` once so the CLI records its new version, or set FREEPI_CLIENT_VERSION, or check connectivity to ${BASE})`
-            : upstream.status === 429
-              ? " (daily free-pi allowance spent — /usage in free-pi, or /buy-credits)"
+            : upstream.status === 429 || upstream.status === 409
+              ? isConcurrencyError(upstream.status, detail)
+                ? " (free-pi concurrency limit — the proxy retries these; seeing this means every slot stayed busy through all retries, so lower PROXY_MAX_PARALLEL or wait a moment)"
+                : " (daily free-pi allowance spent — /usage in free-pi, or /buy-credits)"
               : "";
-    return json(res, overflow ? 413 : upstream.status === 401 || upstream.status === 429 ? upstream.status : 502,
+    return json(res, overflow ? 413 : upstream.status === 401 || upstream.status === 429 || upstream.status === 409 ? upstream.status : 502,
       openAIError(`free-pi backend ${upstream.status}: ${detail}${hint}`, overflow ? "context_too_long" : "api_error"));
   }
 
@@ -1986,6 +2049,7 @@ server.listen(PORT, HOST, async () => {
   console.log(`  client ver   ${getClientVersion()} (backend min ${versionInfo.min ?? "?"}, latest ${versionInfo.latest ?? "?"})`);
   console.log(`  credentials  ${CREDENTIALS_PATH} (${token ? "signed in" : "NOT SIGNED IN — run npx free-pi-cli@latest"})`);
   console.log(`  session      ${SESSION_ID}`);
+  console.log(`  parallel     up to ${MAX_PARALLEL} concurrent stream(s), distinct x-session-id per slot`);
   console.log(`  auth         ${PROXY_API_KEY ? "PROXY_API_KEY required" : "open (binds to localhost only)"}`);
   console.log(`  default model ${DEFAULT_MODEL} (unknown model names route here)`);
   console.log(`  dashboard     http://${HOST === "0.0.0.0" ? "<this-host>" : HOST}:${PORT}/`);
